@@ -1,0 +1,15 @@
+{
+  "device": "cpu",
+  "files_converted": 13460,
+  "files_found": 13460,
+  "files_skipped_existing": 0,
+  "fps": 30,
+  "frames_converted": 1489149,
+  "input_root": "/mnt/afs/mogo_base/datasets/MotionFix/hymotion201_o6dp_hml272",
+  "kimodo_root": "/mnt/afs/UMO_debug/outside_material/kimodo",
+  "manifest": "/mnt/afs/mogo_base/datasets/MotionFix/kimodo273_from_hy201_smplx22/manifest.jsonl",
+  "output_root": "/mnt/afs/mogo_base/datasets/MotionFix/kimodo273_from_hy201_smplx22",
+  "pattern": "**/*.npy",
+  "stats_mean": "/mnt/afs/mogo_base/datasets/MotionFix/kimodo273_from_hy201_smplx22/stats/Mean.npy",
+  "stats_std": "/mnt/afs/mogo_base/datasets/MotionFix/kimodo273_from_hy201_smplx22/stats/Std.npy"
+}

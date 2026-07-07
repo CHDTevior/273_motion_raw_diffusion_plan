@@ -1,0 +1,137 @@
+{
+  "bad_shape": [],
+  "coordinate_contract": {
+    "forward_reference": "+Z when first_heading_angle=0",
+    "ground_plane": "XZ",
+    "position_units": "meters",
+    "raw_archive": "to_canonicalize=False",
+    "system": "right-handed",
+    "up_axis": "Y+"
+  },
+  "files_checked": 13460,
+  "first_heading_zero_forward_vector": [
+    0.0,
+    0.0,
+    1.0
+  ],
+  "foot_contact_non_binary_frames": 0,
+  "foot_contact_saved_vs_official_detector_abs_err_max": 0.0,
+  "frames_checked": 1489149,
+  "global_rot6d_saved_vs_official_cont6d_abs_err_max": 0.0,
+  "global_rot_saved_vs_fk_global_rot_abs_err_max": 4.771839675621337e-07,
+  "heading_norm_abs_err_max": 4.505312845015652e-08,
+  "heading_saved_vs_hips_recomputed_abs_err_max": 0.0,
+  "joint_names_match_smplx22": [
+    "pelvis",
+    "left_hip",
+    "right_hip",
+    "spine1",
+    "left_knee",
+    "right_knee",
+    "spine2",
+    "left_ankle",
+    "right_ankle",
+    "spine3",
+    "left_foot",
+    "right_foot",
+    "neck",
+    "left_collar",
+    "right_collar",
+    "head",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist"
+  ],
+  "kimodo_root": "/mnt/afs/UMO_debug/outside_material/kimodo",
+  "local_joint_pos_saved_vs_recomputed_abs_err_max": 0.0,
+  "local_joint_pos_xz_plus_smooth_root_vs_global_pos_abs_err_max": 2.384185791015625e-07,
+  "local_joint_pos_y_vs_global_y_abs_err_max": 0.0,
+  "missing_source_files": [],
+  "non_finite": [],
+  "official_slice_dict": {
+    "foot_contacts": [
+      269,
+      273
+    ],
+    "global_root_heading": [
+      3,
+      5
+    ],
+    "global_rot_data": [
+      71,
+      203
+    ],
+    "local_joints_positions": [
+      5,
+      71
+    ],
+    "smooth_root_pos": [
+      0,
+      3
+    ],
+    "velocities": [
+      203,
+      269
+    ]
+  },
+  "parents": [
+    -1,
+    0,
+    0,
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    9,
+    9,
+    12,
+    13,
+    14,
+    16,
+    17,
+    18,
+    19
+  ],
+  "repo_expected_slices": {
+    "foot_contacts": [
+      269,
+      273
+    ],
+    "global_root_heading": [
+      3,
+      5
+    ],
+    "global_rot_data": [
+      71,
+      203
+    ],
+    "local_joints_positions": [
+      5,
+      71
+    ],
+    "smooth_root_pos": [
+      0,
+      3
+    ],
+    "velocities": [
+      203,
+      269
+    ]
+  },
+  "root": "/mnt/afs/mogo_base/datasets/MotionFix/kimodo273_from_hy201_smplx22",
+  "saved_vs_official_full_feature_abs_err_max": 0.0,
+  "slice_matches_official": true,
+  "smooth_root_saved_vs_recomputed_abs_err_max": 0.0,
+  "smooth_root_y_vs_source_root_y_abs_err_max": 0.0,
+  "source_hy_root": "/mnt/afs/mogo_base/datasets/MotionFix/hymotion201_o6dp_hml272",
+  "velocity_saved_vs_global_finite_diff_abs_err_max": 0.0
+}

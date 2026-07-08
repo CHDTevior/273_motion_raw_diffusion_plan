@@ -12,7 +12,7 @@ remote:
   https://github.com/CHDTevior/HY201_to_K273.git
 
 commit:
-  b004e82
+  ea668b7
 ```
 
 Key files:
@@ -37,19 +37,40 @@ Key files:
   split_kimodo273
 
 /mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:57
+  split_existing/splits split id reader
+
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:75
+  split filtering supports HumanML3D motion_data + split_existing
+
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:88
   Kimodo273MotionDataset
 
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:110
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:139
   __getitem__ loads [T,273]
 
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:115
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:144
   normalization
 
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:118
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:147
   contacts restored raw 0/1 unless normalize_contacts=True
 
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:140
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:169
   collate_kimodo273_batch
+
+/mnt/afs/UMO_debug/hy201_to_kimodo273/README.md:259
+  HumanML3D full conversion summary
+
+/mnt/afs/UMO_debug/hy201_to_kimodo273/README.md:323
+  HumanML3D numeric QA result
+
+/mnt/afs/UMO_debug/hy201_to_kimodo273/README.md:339
+  HumanML3D semantic audit result
+
+/mnt/afs/UMO_debug/hy201_to_kimodo273/REPORT.md:468
+  HumanML3D full conversion section
+
+/mnt/afs/UMO_debug/hy201_to_kimodo273/REPORT.md:519
+  HumanML3D QA section
 ```
 
 ## Kimodo

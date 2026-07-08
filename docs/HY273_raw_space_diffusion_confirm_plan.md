@@ -47,45 +47,98 @@ raw model output: [B,T,273] = clean x0 prediction
 ```text
 local repo: /mnt/afs/UMO_debug/hy201_to_kimodo273
 remote:     https://github.com/CHDTevior/HY201_to_K273.git
-commit:     b004e82
+commit:     ea668b7
 ```
 
-数据：
+第一版训练主数据：
 
 ```text
-converted Kimodo273:
-  /mnt/afs/mogo_base/datasets/MotionFix/kimodo273_from_hy201_smplx22
+HumanML3D converted Kimodo273:
+  /mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22
 
 source HY201:
-  /mnt/afs/mogo_base/datasets/MotionFix/hymotion201_o6dp_hml272
+  /mnt/afs/mogo_base/datasets/HumanML3D/hymotion201_o6dp_hml272
+
+captions:
+  /mnt/afs/mogo_base/datasets/HumanML3D/texts
+
+splits:
+  /mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22/split_existing/{train,val,test}.txt
 ```
 
-semantic audit：
+HumanML3D numeric audit：
 
 ```text
-/mnt/afs/UMO_debug/eval_runs/hy201_to_kimodo273_motionfix_full/semantic_audit_summary.json
+/mnt/afs/UMO_debug/eval_runs/hy201_to_kimodo273_humanml3d_full/audit_summary.json
 ```
 
-我已核对的关键结果：
+HumanML3D semantic audit：
 
 ```text
-files_checked: 13460
-frames_checked: 1489149
+/mnt/afs/UMO_debug/eval_runs/hy201_to_kimodo273_humanml3d_full/semantic_audit_summary.json
+```
+
+我已核对的 HumanML3D 关键结果：
+
+```text
+files_checked: 26846
+frames_checked: 5945004
 slice_matches_official: true
+saved_vs_recomputed_full_feature_abs_err_max: 0.0
 saved_vs_official_full_feature_abs_err_max: 0.0
+smooth_root_saved_vs_recomputed_abs_err_max: 0.0
 smooth_root_y_vs_source_root_y_abs_err_max: 0.0
 heading_saved_vs_hips_recomputed_abs_err_max: 0.0
-local_joint_pos_xz_plus_smooth_root_vs_global_pos_abs_err_max: 2.384185791015625e-07
+local_joint_pos_saved_vs_recomputed_abs_err_max: 0.0
+local_joint_pos_xz_plus_smooth_root_vs_global_pos_abs_err_max: 4.76837158203125e-07
 local_joint_pos_y_vs_global_y_abs_err_max: 0.0
 global_rot6d_saved_vs_official_cont6d_abs_err_max: 0.0
 velocity_saved_vs_global_finite_diff_abs_err_max: 0.0
 foot_contact_saved_vs_official_detector_abs_err_max: 0.0
+foot_contact_non_binary_frames: 0
+bad_shape: []
+non_finite: []
+smooth_root_fallback_files: 4
 ```
 
-数据统计：
+HumanML3D 数据统计：
 
 ```text
 converted clip files:
+  train: 21466
+  val:    1338
+  test:   4042
+  total: 26846
+
+frames_converted: 5945004
+shape per clip: [T,273]
+stats:
+  stats/Mean.npy
+  stats/Std.npy
+caption coverage:
+  total clips: 26846
+  missing caption files: 0
+```
+
+HumanML3D 有 4 个 3-frame 极短 clip 触发 Kimodo 官方 smooth-root solver 的 `Factor is exactly singular`。转换器只对这 4 个 clip 的 smooth-root XZ 使用 raw-root fallback，Y 保持原值；其它 channel 仍走官方 Kimodo FK / heading / velocity / contact / cont6d 逻辑，semantic audit 全量通过。
+
+```text
+motion_data/000990.npy
+motion_data/005836.npy
+motion_data/M000990.npy
+motion_data/M005836.npy
+```
+
+MotionFix K273 仍保留为后续 MotionFix edit/control 数据和协议参考：
+
+```text
+MotionFix converted Kimodo273:
+  /mnt/afs/mogo_base/datasets/MotionFix/kimodo273_from_hy201_smplx22
+
+MotionFix source HY201:
+  /mnt/afs/mogo_base/datasets/MotionFix/hymotion201_o6dp_hml272
+
+MotionFix converted clip files:
   train: 10774
   val:    660
   test:  2026
@@ -98,9 +151,7 @@ MotionFix paired records:
   total: 6730 pairs
 ```
 
-这个数量关系已经复核过：6730 个 pair 正好展开成 13460 个 source/target clip files。
-
-全量 pair manifest 不是 HY201 子目录里的旧 manifest，而是 MotionFix 根目录下这两套之一：
+MotionFix 全量 pair manifest 是 MotionFix 根目录下这两套之一：
 
 ```text
 /mnt/afs/mogo_base/datasets/MotionFix/manifests/motionfix_motionstreamer272_hml_{train,val,test}.jsonl
@@ -290,7 +341,7 @@ inference constraints are authored relative to that canonical origin
 from hy201_to_kimodo273 import Kimodo273TorchDataset, collate_kimodo273_batch
 
 dataset = Kimodo273TorchDataset(
-    "/mnt/afs/mogo_base/datasets/MotionFix/kimodo273_from_hy201_smplx22",
+    "/mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22",
     split="train",
     normalize=False,
 )
@@ -300,32 +351,44 @@ dataset = Kimodo273TorchDataset(
 
 ```text
 /mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:57
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:110
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:140
+  split_existing/splits split id reader
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:75
+  split filtering: directory prefix first, then split_existing ids
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:88
+  Kimodo273MotionDataset
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:139
+  __getitem__ loads [T,273]
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:169
+  collate_kimodo273_batch
 ```
 
 normalize=True 时 contacts 默认仍保持 0/1：
 
 ```text
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:115
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:118
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:120
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:144
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:147
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:149
 ```
 
 第一版我会在本项目里写一个薄 wrapper：
 
 ```text
-data/kimodo273_motionfix.py
+data/kimodo273_datasets.py
 ```
 
 支持两个 mode：
 
 ```text
-clip mode:
-  读取 converted source/target clips as independent motions
-  用于 raw motion prior + synthetic control training
+hml3d mode:
+  root:
+    /mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22
+  split:
+    split_existing/{train,val,test}.txt
+  text:
+    /mnt/afs/mogo_base/datasets/HumanML3D/texts/{motion_id}.txt
+  用于第一版 HY273 raw prior + HumanML3D text-conditioned training + synthetic control training
 
-pair mode:
+motionfix_pair mode:
   join source, target, instruction from:
     /mnt/afs/mogo_base/datasets/MotionFix/manifests/motionfix_motionstreamer272_hml_{split}.jsonl
   或:
@@ -336,7 +399,7 @@ pair mode:
   用于之后 MotionFix edit/instruction 条件，不作为第一版 base prior 的主目标
 ```
 
-第一版 base/control 训练用 clip mode。MotionFix instruction 是“如何从 source 改到 target”的编辑指令，不是 target 的普通动作 caption，所以我不会把它直接当 T2M caption 喂给 base prior。
+第一版 base/control 训练用 HumanML3D mode。HumanML3D text 是 target motion caption，可以作为第一版 `condition_mode=hml_text`。MotionFix instruction 是“如何从 source 改到 target”的编辑指令，不是 target 的普通动作 caption，所以 MotionFix text 仍不直接喂给 base prior。
 
 运行环境也已确认：
 
@@ -356,7 +419,7 @@ extra path:   PYTHONPATH=/mnt/afs/UMO_debug/hy201_to_kimodo273:$PYTHONPATH
 
 ```text
                       text mode
-                 empty/null or future instruction
+              HumanML3D caption or dropped null
                             |
                             v
                       TextCondition
@@ -490,7 +553,7 @@ Kimodo-style imputation
   model_in = concat(x_imp, mask.float)
       |
       v
-HY273RawDenoiser(model_in, t, c_dir, text/null, length_mask)
+HY273RawDenoiser(model_in, t, c_dir, hml_text/null_dropout, length_mask)
       |
       v
 pred [B,T,273]
@@ -562,7 +625,7 @@ x_T ~ N(0,I) [B,T,273]
 for ddim step k = K-1 ... 0:
     x_t = x_t*(1-mask) + obs*mask
     model_in = concat(x_t, mask.float)
-    pred = HY273RawDenoiser(model_in, t_k, c_dir, text/null)
+    pred = HY273RawDenoiser(model_in, t_k, c_dir, hml_text/null_dropout)
     x0_hat = concat(pred_cont, sigmoid(contact_logits))
     x0_hat = x0_hat*(1-mask) + obs*mask
     x_{t-1} = DDIM(x_t, x0_hat, t_k)
@@ -674,9 +737,9 @@ external_repos/kimodo/kimodo/metrics/foot_skate.py
 
 ```text
 Step 1. 数据 wrapper 和 representation 常量
-  data/kimodo273_motionfix.py
+  data/kimodo273_datasets.py
   models/raw_motion/hy273_slices.py
-  tests: slice, loader, contacts 0/1
+  tests: slice, HumanML3D split loader, captions, contacts 0/1
 
 Step 2. normalizer + transform
   models/raw_motion/hy273_normalizer.py
@@ -700,7 +763,7 @@ Step 5. raw DiT model
   input 546 -> hidden
   FrameMotionTextDiT backbone
   direction condition c_dir
-  null text mode first
+  HumanML3D text condition + null dropout first
   tests: forward [B,T,546] -> [B,T,273]
 
 Step 6. training harness
@@ -721,7 +784,7 @@ Step 8. quality extensions
   turn on FK/foot/ground losses after smoke weight check
   separated CFG if text/control branches need it
   contact-aware postprocess
-  pair-mode MotionFix edit conditioning if we decide to train edit model
+  pair-mode MotionFix edit conditioning after HumanML3D base/control is stable
 ```
 
 ## 11. 第一轮启动命令形态
@@ -731,9 +794,10 @@ Step 8. quality extensions
 ```text
 PYTHONPATH=/mnt/afs/UMO_debug/hy201_to_kimodo273:$PYTHONPATH \
 /root/miniconda3/envs/mogo/bin/python train_hy273_raw_ddpm.py \
-  --data_root /mnt/afs/mogo_base/datasets/MotionFix/kimodo273_from_hy201_smplx22 \
+  --data_root /mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22 \
+  --text_root /mnt/afs/mogo_base/datasets/HumanML3D/texts \
   --split train \
-  --condition_mode null \
+  --condition_mode hml_text \
   --batch_size 4 \
   --max_steps 20 \
   --num_workers 2
@@ -744,9 +808,11 @@ PYTHONPATH=/mnt/afs/UMO_debug/hy201_to_kimodo273:$PYTHONPATH \
 ```text
 PYTHONPATH=/mnt/afs/UMO_debug/hy201_to_kimodo273:$PYTHONPATH \
 /root/miniconda3/envs/mogo/bin/torchrun --nproc_per_node=4 train_hy273_raw_ddpm.py \
-  --data_root /mnt/afs/mogo_base/datasets/MotionFix/kimodo273_from_hy201_smplx22 \
+  --data_root /mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22 \
+  --text_root /mnt/afs/mogo_base/datasets/HumanML3D/texts \
   --split train \
-  --condition_mode null \
+  --condition_mode hml_text \
+  --text_dropout_prob <待定, e.g. 0.1> \
   --batch_size_per_gpu <待测吞吐后定> \
   --epochs <确认后定> \
   --ddpm_steps 1000 \
@@ -762,7 +828,7 @@ PYTHONPATH=/mnt/afs/UMO_debug/hy201_to_kimodo273:$PYTHONPATH \
 
 ```text
 /mnt/afs/UMO_debug/hy201_to_kimodo273
-  git commit: b004e82
+  git commit: ea668b7
 
 /mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/geometry.py:22
   DIM_KIMODO273 = 273
@@ -782,15 +848,32 @@ loader：
 
 ```text
 /mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:57
+  split_existing/splits split id reader
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:75
+  split filtering supports HumanML3D motion_data + split_existing
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:88
   Kimodo273MotionDataset
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:110
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:139
   __getitem__ loads [T,273]
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:115
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:144
   normalization
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:118
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:147
   contacts restored raw 0/1 unless normalize_contacts=True
-/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:140
+/mnt/afs/UMO_debug/hy201_to_kimodo273/hy201_to_kimodo273/dataset.py:169
   collate_kimodo273_batch
+```
+
+HumanML3D loader/caption smoke：
+
+```text
+dataset train len 21466 first_shape (124, 273) first_rel motion_data/000002.npy contact_unique [0.0, 1.0]
+dataset val len 1338 first_shape (204, 273) first_rel motion_data/000016.npy contact_unique [1.0]
+dataset test len 4042 first_shape (175, 273) first_rel motion_data/000000.npy contact_unique [0.0, 1.0]
+batch_motion (4, 300, 273)
+batch_mask (4, 300)
+caption_files_total 26846
+missing caption files: 0
+caption line count min/max/mean: 1 / 4 / 2.9884
 ```
 
 Kimodo representation/control：
@@ -924,8 +1007,10 @@ outside_doc/HY273_raw_space_diffusion_training_control_impl.md:1420
    同时保留 five_point:
      head, left_wrist, right_wrist, left_foot, right_foot
 
-2. 第一版 base/control 训练是否按我建议使用 null text/unconditional prior？
-   MotionFix instruction 我建议先不用于 base prior，因为它是 source->target edit 指令，不是 target caption。
+2. HumanML3D text condition 的 dropout 初值:
+   现在默认 condition_mode=hml_text。
+   我建议 text_dropout_prob 从 0.1 起，用于 CFG/null 分支鲁棒性。
+   MotionFix instruction 仍不用于 base prior，因为它是 source->target edit 指令，不是 target caption。
 
 3. 第一版训练 transform 是否按 Kimodo protocol 默认打开：
    root_origin_shift=true

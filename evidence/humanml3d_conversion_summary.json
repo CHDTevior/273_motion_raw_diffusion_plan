@@ -1,0 +1,39 @@
+{
+  "device": "cpu",
+  "files_converted": 26846,
+  "files_found": 26846,
+  "files_skipped_existing": 0,
+  "fps": 30,
+  "frames_converted": 5945004,
+  "input_root": "/mnt/afs/mogo_base/datasets/HumanML3D/hymotion201_o6dp_hml272",
+  "kimodo_root": "/mnt/afs/UMO_debug/outside_material/kimodo",
+  "manifest": "/mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22/manifest.jsonl",
+  "output_root": "/mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22",
+  "pattern": "motion_data/*.npy",
+  "smooth_root_fallback_examples": [
+    {
+      "input": "/mnt/afs/mogo_base/datasets/HumanML3D/hymotion201_o6dp_hml272/motion_data/000990.npy",
+      "reason": "Factor is exactly singular",
+      "relative_path": "motion_data/000990.npy"
+    },
+    {
+      "input": "/mnt/afs/mogo_base/datasets/HumanML3D/hymotion201_o6dp_hml272/motion_data/005836.npy",
+      "reason": "Factor is exactly singular",
+      "relative_path": "motion_data/005836.npy"
+    },
+    {
+      "input": "/mnt/afs/mogo_base/datasets/HumanML3D/hymotion201_o6dp_hml272/motion_data/M000990.npy",
+      "reason": "Factor is exactly singular",
+      "relative_path": "motion_data/M000990.npy"
+    },
+    {
+      "input": "/mnt/afs/mogo_base/datasets/HumanML3D/hymotion201_o6dp_hml272/motion_data/M005836.npy",
+      "reason": "Factor is exactly singular",
+      "relative_path": "motion_data/M005836.npy"
+    }
+  ],
+  "smooth_root_fallback_files": 4,
+  "stats_mean": "/mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22/stats/Mean.npy",
+  "stats_std": "/mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22/stats/Std.npy",
+  "velocity_single_frame_fallback_files": 0
+}

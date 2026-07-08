@@ -1,0 +1,102 @@
+{
+  "abs_max": 20.099285125732422,
+  "bad_shape": [],
+  "files_checked": 26846,
+  "foot_contact_max": 1.0,
+  "foot_contact_mean": 0.6642696539817299,
+  "foot_contact_min": 0.0,
+  "foot_contact_non_binary_frames": 0,
+  "frames_checked": 5945004,
+  "global_max": 20.099285125732422,
+  "global_min": -15.056453704833984,
+  "global_rot_orthogonality_abs_err_max": 1.1102230246251565e-15,
+  "heading_norm_abs_err_max": 4.506793616076976e-08,
+  "hy_aux_vs_kimodo_local_pos_l2_mean": 0.09325751502142038,
+  "hy_aux_vs_kimodo_local_pos_l2_p95": 0.3522390355043843,
+  "inverse_local_rot_abs_err_max": 4.76837158203125e-07,
+  "inverse_pos_rotation_vs_position_abs_err_max": 9.5367431640625e-07,
+  "inverse_root_abs_err_max": 0.0,
+  "inverse_source_root_abs_err_max": 3.725290298461914e-09,
+  "kimodo_root": "/mnt/afs/UMO_debug/outside_material/kimodo",
+  "local_joints_pos_max": [
+    1.1538382768630981,
+    2.6749494075775146,
+    1.127822995185852
+  ],
+  "local_joints_pos_min": [
+    -1.1557912826538086,
+    -0.2319890260696411,
+    -1.133607029914856
+  ],
+  "non_finite": [],
+  "root": "/mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22",
+  "skeleton_joint_names": [
+    "pelvis",
+    "left_hip",
+    "right_hip",
+    "spine1",
+    "left_knee",
+    "right_knee",
+    "spine2",
+    "left_ankle",
+    "right_ankle",
+    "spine3",
+    "left_foot",
+    "right_foot",
+    "neck",
+    "left_collar",
+    "right_collar",
+    "head",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist"
+  ],
+  "skeleton_parents": [
+    -1,
+    0,
+    0,
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    9,
+    9,
+    12,
+    13,
+    14,
+    16,
+    17,
+    18,
+    19
+  ],
+  "smooth_root_max": [
+    7.059617042541504,
+    2.048841714859009,
+    10.09128475189209
+  ],
+  "smooth_root_min": [
+    -7.059617042541504,
+    0.01789689064025879,
+    -9.69858169555664
+  ],
+  "source_hy_root": "/mnt/afs/mogo_base/datasets/HumanML3D/hymotion201_o6dp_hml272",
+  "velocity_max": [
+    12.363216400146484,
+    14.161975860595703,
+    20.099285125732422
+  ],
+  "velocity_min": [
+    -12.334806442260742,
+    -13.584176063537598,
+    -15.056453704833984
+  ]
+}

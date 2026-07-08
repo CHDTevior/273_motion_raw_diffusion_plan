@@ -20,11 +20,22 @@ five_point:
 
 Reason: Kimodo's end-effector expansion for SMPLX22 maps foot controls to ankle+foot pairs, while the project phrase "five endpoints" may mean a separate application-level convention.
 
-## 2. First Training Condition Mode
+## 2. HumanML3D Text Condition Dropout
 
-Recommendation: start with `condition_mode=null`, i.e. a null-text/unconditional raw motion prior plus synthetic control masks.
+Recommendation: use `condition_mode=hml_text` for the first training pass, with null/text dropout for robustness and later CFG.
 
-Reason: MotionFix instructions are source-to-target edit instructions, not target-motion captions. Feeding them directly as T2M captions would mix edit semantics into the base prior.
+```text
+primary data:
+  /mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22
+
+captions:
+  /mnt/afs/mogo_base/datasets/HumanML3D/texts
+
+recommended initial text_dropout_prob:
+  0.1
+```
+
+Reason: HumanML3D text files are target-motion captions and have full coverage for the converted Kimodo273 archive. MotionFix instructions remain source-to-target edit instructions, so they should not be used as base-prior captions.
 
 ## 3. Kimodo-Style Sequence Transform Defaults
 

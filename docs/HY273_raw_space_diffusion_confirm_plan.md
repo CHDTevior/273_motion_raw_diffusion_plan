@@ -464,10 +464,100 @@ noisy x_t [B,T,273]  |
  Linear H -> 273
           |
           v
- pred [B,T,273]
+pred [B,T,273]
    0:269     normalized flow velocity for continuous HY273 channels
    269:273   clean contact logits
 ```
+
+### 5.1 raw-space 和内部 hidden dim 的边界
+
+`raw-space` 只表示 flow/diffusion 的随机变量、训练 target、控制 overwrite、评估输出都在
+HY273/Kimodo273 源数据域里，不表示 Transformer 内部必须一直保持 273 维。模型仍然需要正常做
+input projection 和 output projection：
+
+```text
+x_t / z_t source state        [B,T,273]
+observed_motion source state  [B,T,273]
+motion_mask                   [B,T,273]
+        |
+        v
+concat(x_imp, mask.float)     [B,T,546]
+        |
+        v
+Linear 546 -> H
+        |
+        v
+DiT / Transformer hidden      [B,T,H]
+        |
+        v
+Linear H -> 273
+        |
+        v
+flow velocity / contact head  [B,T,273]
+```
+
+Kimodo 官方 SMPLX22 表示维度按代码实例化核对过：
+
+```text
+motion_rep_dim:       273
+global_root_dim:        5
+body_dim:             268
+local_root_dim:         4
+
+[0:3]     smooth_root_pos        3
+[3:5]     global_root_heading    2
+[5:71]    local_joints_positions 66
+[71:203]  global_rot_data        132
+[203:269] velocities             66
+[269:273] foot_contacts          4
+```
+
+Kimodo 官方 two-stage denoiser 也不是在 Transformer 内部固定 273 维，而是投到配置里的
+`latent_dim`：
+
+```text
+root stage:
+  input_dim with mask concat = 273 * 2 = 546
+  input_linear: 546 -> latent_dim
+  output_linear: latent_dim -> 5
+
+body stage:
+  local_motion_rep_dim = 273 - 5 + 4 = 272
+  input_dim with mask concat = 272 + 273 = 545
+  input_linear: 545 -> latent_dim
+  output_linear: latent_dim -> 268
+
+final output:
+  root 5 + body 268 = 273
+```
+
+可核对代码：
+
+```text
+external_repos/kimodo/kimodo/motion_rep/reps/base.py:65
+  motion_rep_dim = sum(size_dict)
+external_repos/kimodo/kimodo/motion_rep/reps/base.py:67
+  body_slice / body_dim
+external_repos/kimodo/kimodo/motion_rep/reps/base.py:69
+  global_root_dim / local_root_dim
+external_repos/kimodo/kimodo/model/twostage_denoiser.py:33
+  input_dim = motion_rep.motion_rep_dim
+external_repos/kimodo/kimodo/model/twostage_denoiser.py:37
+  root_input_dim = input_dim * 2 when mask concat
+external_repos/kimodo/kimodo/model/twostage_denoiser.py:48
+  local_motion_rep_dim = input_dim - global_root_dim + local_root_dim
+external_repos/kimodo/kimodo/model/twostage_denoiser.py:51
+  body_input_dim = local_motion_rep_dim + input_dim when mask concat
+external_repos/kimodo/kimodo/model/backbone.py:117
+  input_linear = Linear(input_dim, latent_dim)
+external_repos/kimodo/kimodo/model/backbone.py:118
+  output_linear = Linear(latent_dim, output_dim)
+```
+
+`nvidia/Kimodo-SMPLX-RP-v1` 的 `config.yaml` 是 gated；当前机器未认证时只能看到文件列表，
+下载配置会返回 401。因此官方 checkpoint 的精确 `latent_dim / ff_size / num_layers / num_heads`
+需要有权限的 HF token 或本地已下载配置才能最终确认。实施上第一版会把 `H` 做成显式配置，
+默认跟现有 CodeFlow/DiT backbone 的 hidden dim 对齐，而不是硬编码成 273。
 
 当前项目参考：
 

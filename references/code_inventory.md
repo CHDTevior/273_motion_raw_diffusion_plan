@@ -210,6 +210,39 @@ train_codeflow.py:2916
 
 train_codeflow.py:2955
   save latest checkpoint
+
+train_codeflow.py:574
+  prepare_flow_training_state
+
+train_codeflow.py:600
+  z_t = t*x0 + (1-t)*noise
+
+train_codeflow.py:611
+  clean estimate from predicted velocity
+
+models/codeflow/continuous_motion_code_flow.py:60
+  z_t = t*x0 + (1-t)*noise
+
+models/codeflow/continuous_motion_code_flow.py:61
+  velocity_target = x0 - noise
+
+models/codeflow/continuous_motion_code_flow.py:95
+  flow_loss on predicted velocity
+
+models/codeflow/continuous_motion_code_flow.py:98
+  clean_pred from velocity
+
+models/codeflow/motion_code_flow.py:707
+  ODE sampling grid
+
+models/codeflow/motion_code_flow.py:760
+  guided velocity and clean estimate during sampling
+
+models/codeflow/motion_code_flow.py:761
+  z = z + dt*v
+
+models/codeflow/motion_code_flow.py:764
+  self-conditioning uses clean estimate
 ```
 
 ## Raw-Space Plan Reference
@@ -228,10 +261,10 @@ outside_doc/HY273_raw_space_diffusion_training_control_impl.md:237
   global joint target requires same-frame smooth_root_ref
 
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:513
-  DDPM clean x0 prediction first
+  old conservative baseline said DDPM clean x0 first; current confirmation plan supersedes this with flow-matching first
 
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:993
-  Flow Matching is second stage after DDPM is stable
+  old note placed Flow Matching second; current confirmation plan moves Flow Matching / ODE to first implementation
 
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:1007
   Phase 1 no-control natural prior
@@ -240,7 +273,7 @@ outside_doc/HY273_raw_space_diffusion_training_control_impl.md:1026
   Phase 2 realistic control sampler patterns
 
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:1197
-  DDPM/DDIM sampling with step-wise clamp
+  old DDPM/DDIM step-wise clamp maps to ODE step-wise clamp in the current plan
 
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:1291
   postprocess is part of the system

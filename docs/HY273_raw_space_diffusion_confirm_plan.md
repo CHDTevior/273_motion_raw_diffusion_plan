@@ -1,4 +1,4 @@
-# HY273 Raw-Space Diffusion Harness 确认版计划
+# HY273 Raw-Space Flow Harness 确认版计划
 
 本文是实施前确认文档。它吸收了已经完成的 HY201 -> Kimodo273 数据转换、semantic audit 结论，以及“不做错误 canonicalize”的边界。等你确认后，我再按这里的顺序开始写代码。
 
@@ -15,8 +15,8 @@
 ```text
 raw Kimodo273 / HY273 motion prior
   + same-space observed_motion/motion_mask 控制训练
-  + DDPM clean x0 prediction
-  + DDIM32 clamp-each-step 控制采样
+  + rectified-flow / flow-matching velocity prediction
+  + ODE32 clamp-each-step 控制采样
   + root / five-endpoint / fullpose / mixed 控制评估
 ```
 
@@ -34,10 +34,11 @@ raw Kimodo273 / HY273 motion prior
 模型第一版：
 
 ```text
-HY273RawDenoiser = current FrameMotionTextDiT-style denoiser
+HY273RawFlow = current FrameMotionTextDiT-style flow denoiser
 
 raw model input:  [B,T,546] = concat(imputed noisy HY273, control mask)
-raw model output: [B,T,273] = clean x0 prediction
+raw model output: [B,T,273] = flow velocity v = x0 - noise
+clean estimate:   x0_hat = z_t + (1 - t) * v_pred
 ```
 
 ## 1. 已确认数据
@@ -428,7 +429,7 @@ extra path:   PYTHONPATH=/mnt/afs/UMO_debug/hy201_to_kimodo273:$PYTHONPATH
                       text tokens
                             |
                             |
-DDPM t ----> TimestepEmbed ----+
+Flow t ----> TimestepEmbed ----+
                                |
 c_dir ----> DirectionEmbed ----+----> global cond [B,H]
                                |
@@ -463,9 +464,9 @@ noisy x_t [B,T,273]  |
  Linear H -> 273
           |
           v
- pred clean x0 [B,T,273]
-   0:269     continuous normalized clean features
-   269:273   contact logits
+ pred [B,T,273]
+   0:269     normalized flow velocity for continuous HY273 channels
+   269:273   clean contact logits
 ```
 
 当前项目参考：
@@ -501,6 +502,43 @@ NumPy 2.x under mogo env removes np.float
 ```
 
 因此 raw harness 复用 DiT 时会避免触发包级 `models.codeflow` 初始化，或先做兼容性修复；不在训练入口里临时 monkey patch。
+
+为什么第一版改成 Flow/ODE，而不是 DDPM/DDIM：
+
+```text
+train_codeflow.py:574
+  prepare_flow_training_state
+train_codeflow.py:587
+  target_model = model.raw_to_model_latent(target_embeddings)
+train_codeflow.py:588
+  noise = randn_like(target_model)
+train_codeflow.py:599
+  t_view = timesteps[:, None, None, None]
+train_codeflow.py:600
+  z_t = t*x0 + (1-t)*noise
+train_codeflow.py:611
+  clean_init = predict_clean_from_velocity(z_t, t, v_init)
+
+models/codeflow/continuous_motion_code_flow.py:60
+  z_t = t*x0 + (1-t)*noise
+models/codeflow/continuous_motion_code_flow.py:61
+  velocity_target = x0 - noise
+models/codeflow/continuous_motion_code_flow.py:95
+  flow_loss = MSE(v_pred, velocity_target)
+models/codeflow/continuous_motion_code_flow.py:98
+  clean_pred = predict_clean_from_velocity(z_t, t, v_pred)
+
+models/codeflow/motion_code_flow.py:707
+  sampling grid
+models/codeflow/motion_code_flow.py:760
+  v, clean = forward_guided(...)
+models/codeflow/motion_code_flow.py:761
+  z = z + dt*v
+models/codeflow/motion_code_flow.py:764
+  x_self_cond = clean.detach()
+```
+
+所以 raw HY273 第一版应继承这个连续 flow 训练/采样能力，只把 latent 从 VQ code embedding 换成 normalized HY273 raw feature。DDPM/DDIM 只作为以后对照实验，不作为主线。
 
 ## 6. 训练 Tensor Information Flow
 
@@ -542,41 +580,44 @@ x0 [B,T,273]                          v
                                 obs [B,T,273]
       |
       v
-DDPM q_sample
-  t:   [B]
-  eps: [B,T,273]
-  x_t = sqrt_ab[t]*x0 + sqrt_1m_ab[t]*eps
+Rectified flow interpolation
+  t:     [B], sampled by logit-normal or uniform schedule
+  noise: [B,T,273]
+  z_t = t*x0 + (1-t)*noise
+  v_target = x0 - noise
       |
       v
 Kimodo-style imputation
-  x_imp = x_t*(1-mask) + obs*mask
-  model_in = concat(x_imp, mask.float)
+  z_imp = z_t*(1-mask) + obs*mask
+  model_in = concat(z_imp, mask.float)
       |
       v
-HY273RawDenoiser(model_in, t, c_dir, hml_text/null_dropout, length_mask)
+HY273RawFlow(model_in, t, c_dir, hml_text/null_dropout, length_mask)
       |
       v
 pred [B,T,273]
       |
-      +--> pred_cont    = pred[...,0:269]
+      +--> v_pred_cont  = pred[...,0:269]
       +--> contact_logit= pred[...,269:273]
       +--> contact_prob = sigmoid(contact_logit)
       |
       v
 x0_hat_pred
-  concat(pred_cont, contact_prob)
+  x0_hat_cont = z_t[...,0:269] + (1-t)*v_pred_cont
+  x0_hat = concat(x0_hat_cont, contact_prob)
       |
       +--> training losses use this pre-clamp prediction
       |
       v
 x0_hat_for_sampler_or_eval_clamped
-  only for DDIM sampling / exact-control eval path:
+  only for ODE sampling / exact-control eval path:
   clamp controlled dims:
     x0_hat_clamped = x0_hat_pred*(1-mask) + obs*mask
       |
       v
 Loss
-  L_clean_cont
+  L_flow_cont_unmasked
+  L_clean_cont_optional
   L_contact_bce
   L_control_masked
   L_global_control
@@ -586,11 +627,14 @@ Loss
 第一版 loss：
 
 ```text
-L_clean_cont:
-  SmoothL1(pred[...,0:269], x0[...,0:269]) on valid frames
+L_flow_cont_unmasked:
+  MSE(v_pred_cont, v_target[...,0:269]) on valid frames and unmasked dims
 
 L_contact:
   BCEWithLogits(pred[...,269:273], x0[...,269:273]) on valid frames
+
+L_clean_cont_optional:
+  SmoothL1(x0_hat_pred[...,0:269], x0[...,0:269]) on valid frames, small weight
 
 L_control:
   SmoothL1(x0_hat_pred, obs) only on motion_mask and valid frames
@@ -619,17 +663,22 @@ ConstraintCompiler
 Normalize obs continuous dims, contacts stay 0/1
       |
       v
-x_T ~ N(0,I) [B,T,273]
+z_0 ~ N(0,I) [B,T,273]
       |
       v
-for ddim step k = K-1 ... 0:
-    x_t = x_t*(1-mask) + obs*mask
-    model_in = concat(x_t, mask.float)
-    pred = HY273RawDenoiser(model_in, t_k, c_dir, hml_text/null_dropout)
-    x0_hat = concat(pred_cont, sigmoid(contact_logits))
+for ODE step k = 0 ... K-1:
+    t_k -> t_{k+1}
+    z_t = z_t*(1-mask) + obs*mask
+    model_in = concat(z_t, mask.float)
+    pred = HY273RawFlow(model_in, t_k, c_dir, hml_text/null_dropout)
+    v_cont = pred[...,0:269]
+    contact_prob = sigmoid(pred[...,269:273])
+    x0_hat_cont = z_t[...,0:269] + (1-t_k)*v_cont
+    x0_hat = concat(x0_hat_cont, contact_prob)
     x0_hat = x0_hat*(1-mask) + obs*mask
-    x_{t-1} = DDIM(x_t, x0_hat, t_k)
-    x_{t-1} = x_{t-1}*(1-mask) + obs*mask
+    z_{t+dt}[...,0:269] = z_t[...,0:269] + dt*v_cont
+    z_{t+dt}[...,269:273] = contact_prob
+    z_{t+dt} = z_{t+dt}*(1-mask) + obs*mask
       |
       v
 Unnormalize
@@ -648,7 +697,7 @@ Metrics / optional postprocess
 默认采样：
 
 ```text
-DDIM steps: 32
+ODE steps: 32 first, 64 for quality checks if needed
 clamp observed dims: every step
 gradient guidance on z_t: OFF in first baseline
 postprocess: OFF for baseline metrics, optional contact_ik later
@@ -697,7 +746,7 @@ protocols:
   endpoint subset
   fullpose keyframes
   mixed
-DDIM32
+ODE32
 save generated npy + metrics json
 ```
 
@@ -753,21 +802,21 @@ Step 3. constraint compiler
   constraints sampled from transformed x0_un_aug, not original x0_un
   tests: global joint target requires smooth_root_ref
 
-Step 4. diffusion schedule
-  models/raw_motion/diffusion_schedule.py
-  q_sample, DDIM clean-x0 step
+Step 4. flow schedule
+  models/raw_motion/flow_schedule.py
+  sample_t, interpolate z_t, ODE step
   tests: shape, clamp observed dims each step
 
-Step 5. raw DiT model
-  models/raw_motion/raw_dit.py
+Step 5. raw flow DiT model
+  models/raw_motion/raw_flow_dit.py
   input 546 -> hidden
   FrameMotionTextDiT backbone
   direction condition c_dir
   HumanML3D text condition + null dropout first
-  tests: forward [B,T,546] -> [B,T,273]
+  tests: forward [B,T,546] -> velocity/contact head [B,T,273]
 
 Step 6. training harness
-  train_hy273_raw_ddpm.py
+  train_hy273_raw_flow.py
   DDP/AMP/resume/checkpoint latest
   phase1 none-control prior mode
   phase2 patterned control sampler curriculum
@@ -778,6 +827,7 @@ Step 7. sample/eval harness
   sample_hy273_raw.py
   eval_hy273_raw_control.py
   fixed-16 protocols
+  ODE32/ODE64 protocols
   metrics json
 
 Step 8. quality extensions
@@ -793,13 +843,14 @@ Step 8. quality extensions
 
 ```text
 PYTHONPATH=/mnt/afs/UMO_debug/hy201_to_kimodo273:$PYTHONPATH \
-/root/miniconda3/envs/mogo/bin/python train_hy273_raw_ddpm.py \
+/root/miniconda3/envs/mogo/bin/python train_hy273_raw_flow.py \
   --data_root /mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22 \
   --text_root /mnt/afs/mogo_base/datasets/HumanML3D/texts \
   --split train \
   --condition_mode hml_text \
   --batch_size 4 \
   --max_steps 20 \
+  --flow_steps_eval 32 \
   --num_workers 2
 ```
 
@@ -807,7 +858,7 @@ PYTHONPATH=/mnt/afs/UMO_debug/hy201_to_kimodo273:$PYTHONPATH \
 
 ```text
 PYTHONPATH=/mnt/afs/UMO_debug/hy201_to_kimodo273:$PYTHONPATH \
-/root/miniconda3/envs/mogo/bin/torchrun --nproc_per_node=4 train_hy273_raw_ddpm.py \
+/root/miniconda3/envs/mogo/bin/torchrun --nproc_per_node=4 train_hy273_raw_flow.py \
   --data_root /mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22 \
   --text_root /mnt/afs/mogo_base/datasets/HumanML3D/texts \
   --split train \
@@ -815,12 +866,13 @@ PYTHONPATH=/mnt/afs/UMO_debug/hy201_to_kimodo273:$PYTHONPATH \
   --text_dropout_prob <待定, e.g. 0.1> \
   --batch_size_per_gpu <待测吞吐后定> \
   --epochs <确认后定> \
-  --ddpm_steps 1000 \
-  --eval_ddim_steps 32 \
+  --time_schedule logit_normal \
+  --sampling_method ode \
+  --eval_ode_steps 32 \
   --save_latest_every <N>
 ```
 
-我会先根据空卡显存试 batch size，不降采样协议，不把 DDIM32 改成更低，除非你明确允许。
+我会先根据空卡显存试 batch size，不降采样协议，不把 ODE32 改成更低，除非你明确允许。
 
 ## 12. 本轮复核证据
 
@@ -980,15 +1032,17 @@ outside_doc/HY273_raw_space_diffusion_training_control_impl.md:209
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:237
   global joint target requires same-frame smooth_root_ref
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:513
-  DDPM clean x0 prediction first
+  old conservative baseline said DDPM clean x0 first;
+  this confirmation plan supersedes it with flow-matching first to match current backbone
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:993
-  Flow Matching is second stage after DDPM is stable
+  old note placed Flow Matching second;
+  current backbone review moves Flow Matching / ODE to first implementation
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:1007
   Phase 1 no-control natural prior
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:1026
   Phase 2 realistic control sampler patterns
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:1197
-  DDPM/DDIM sampling with step-wise clamp
+  DDPM/DDIM sampling with step-wise clamp in the old note maps here to ODE sampling with step-wise clamp
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:1291
   postprocess is part of the system, not an afterthought
 outside_doc/HY273_raw_space_diffusion_training_control_impl.md:1420

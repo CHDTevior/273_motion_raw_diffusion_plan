@@ -2,7 +2,7 @@
 
 This repository is an audit package for the HY273 raw-space diffusion/control harness plan.
 
-Current scope: the first implementation/training pass should use the HumanML3D Kimodo273 conversion as the primary training dataset. MotionFix Kimodo273 remains in the package as a later edit/control dataset reference.
+Current scope: the first implementation/training pass should use the HumanML3D Kimodo273 conversion as the primary training dataset. The primary generative objective is raw-space rectified flow / flow matching with ODE sampling, matching the current MoGeFlow CodeFlow backbone. MotionFix Kimodo273 remains in the package as a later edit/control dataset reference.
 
 ## Main Document
 

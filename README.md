@@ -7,6 +7,7 @@ Current scope: the first implementation/training pass should use the HumanML3D K
 ## Main Document
 
 - `docs/HY273_raw_space_diffusion_confirm_plan.md`
+- `docs/HY273_hytext_cache_integration_review.md`
 
 This is the current implementation plan after checking:
 
@@ -43,6 +44,23 @@ The JSON files are copied from the checked local data conversion/evaluation outp
 - `references/code_inventory.md`
 
 The reference docs capture the previous plan material and the source-code line references used by the confirmation plan.
+
+## Implementation Snapshot
+
+This repository now includes the current HY273 raw-flow implementation snapshot needed to review the HYText-cache change:
+
+- `models/raw_motion/`
+- `models/codeflow/dit_blocks.py`
+- `data/kimodo273_datasets.py`
+- `train_hy273_raw_flow.py`
+- `sample_hy273_raw.py`
+- `configs/raw_flow_hy273.yaml`
+- `tools/cache_hy273_hytext_embeddings.py`
+- `scripts/launch/train_hy273_raw_flow_stage1_x0_hytext_ddp8.sh`
+- `tests/test_raw_flow_model.py`
+- `tests/test_raw_flow_sampling.py`
+
+The reviewer prompt for this patch is in `docs/HY273_hytext_cache_integration_review.md`.
 
 ## Data Not Included
 

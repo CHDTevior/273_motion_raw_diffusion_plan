@@ -513,23 +513,42 @@ local_root_dim:         4
 ```
 
 Kimodo 官方 two-stage denoiser 也不是在 Transformer 内部固定 273 维，而是投到配置里的
-`latent_dim`：
+`latent_dim`。你提供的 `nvidia/Kimodo-SMPLX-RP-v1` 配置里：
+
+```text
+latent_dim: 1024
+ff_size: 2048
+num_layers: 16
+num_heads: 8
+llm_shape: [1,4096]
+num_text_tokens_override: 50
+input_first_heading_angle: true
+motion_mask_mode: concat
+```
+
+所以 Kimodo-SMPLX-RP 的实际内部主 hidden dim 是 1024：
 
 ```text
 root stage:
   input_dim with mask concat = 273 * 2 = 546
-  input_linear: 546 -> latent_dim
-  output_linear: latent_dim -> 5
+  input_linear: 546 -> 1024
+  transformer hidden: 1024, 16 layers, 8 heads, FFN 2048
+  output_linear: 1024 -> 5
 
 body stage:
   local_motion_rep_dim = 273 - 5 + 4 = 272
   input_dim with mask concat = 272 + 273 = 545
-  input_linear: 545 -> latent_dim
-  output_linear: latent_dim -> 268
+  input_linear: 545 -> 1024
+  transformer hidden: 1024, 16 layers, 8 heads, FFN 2048
+  output_linear: 1024 -> 268
 
 final output:
   root 5 + body 268 = 273
 ```
+
+这里还有一个容易漏掉的 prefix 维度：Kimodo 把 LLM text feature 从 4096 投到 1024，
+并强制 text token 数到 50；再加 timestep token 和 first-heading token，所以 motion token
+前面最多有 `50 + 1 + 1 = 52` 个 1024-d prefix token。
 
 可核对代码：
 
@@ -554,10 +573,9 @@ external_repos/kimodo/kimodo/model/backbone.py:118
   output_linear = Linear(latent_dim, output_dim)
 ```
 
-`nvidia/Kimodo-SMPLX-RP-v1` 的 `config.yaml` 是 gated；当前机器未认证时只能看到文件列表，
-下载配置会返回 401。因此官方 checkpoint 的精确 `latent_dim / ff_size / num_layers / num_heads`
-需要有权限的 HF token 或本地已下载配置才能最终确认。实施上第一版会把 `H` 做成显式配置，
-默认跟现有 CodeFlow/DiT backbone 的 hidden dim 对齐，而不是硬编码成 273。
+实施上第一版会把 `H` 做成显式配置。现在有了 Kimodo-SMPLX-RP 配置后，默认建议用
+`hidden_dim=1024` 作为 raw-flow 主尺度；如果显存/吞吐不合适，再只调这个配置项，不改变
+273 维 source-domain flow/overwrite 契约。
 
 当前项目参考：
 

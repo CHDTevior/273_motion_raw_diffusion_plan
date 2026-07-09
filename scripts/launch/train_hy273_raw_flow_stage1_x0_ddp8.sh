@@ -24,5 +24,5 @@ export MASTER_PORT="${MASTER_PORT:-29691}"
   --ema_decay "${EMA_DECAY:-0.995}" \
   --ema_every "${EMA_EVERY:-10}" \
   --max_steps "${MAX_STEPS:-500000}" \
-  --save_every "${SAVE_EVERY:-1000}" \
+  --save_every "${SAVE_EVERY:-50000}" \
   "$@"

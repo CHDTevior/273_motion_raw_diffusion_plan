@@ -59,10 +59,15 @@ This repository now includes the current HY273 raw-flow implementation snapshot 
 - `tools/cache_hy273_hytext_embeddings.py`
 - `tools/check_hy273_hytext_cache_coverage.py`
 - `scripts/launch/train_hy273_raw_flow_stage1_x0_hytext_ddp8.sh`
+- `scripts/launch/train_hy273_raw_flow_stage2_x0_control_ddp8.sh`
+- `tests/test_hy273_constraints.py`
 - `tests/test_raw_flow_model.py`
 - `tests/test_raw_flow_sampling.py`
 
-The reviewer prompt for this patch is in `docs/HY273_hytext_cache_integration_review.md`.
+The reviewer prompts for the HYText and Stage-2 control patches are in:
+
+- `docs/HY273_hytext_cache_integration_review.md`
+- `docs/HY273_stage2_kimodo_control_review.md`
 
 ## Data Not Included
 

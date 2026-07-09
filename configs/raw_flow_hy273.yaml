@@ -71,6 +71,7 @@ control:
   modes: [none, root, endpoints, fullpose, mixed]
   endpoint_root_ref_mode: kimodo_hidden_root
   endpoint_preset: kimodo_ee
+  endpoint_subset_mode: random_nonempty
   max_keyframes: 8
 
 sampling:

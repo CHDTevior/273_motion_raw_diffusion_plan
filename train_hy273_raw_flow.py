@@ -104,7 +104,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max_epochs", type=int, default=4000)
     p.add_argument("--max_steps", type=int, default=0)
     p.add_argument("--log_every", type=int, default=20)
-    p.add_argument("--save_every", type=int, default=1000)
+    p.add_argument("--save_every", type=int, default=50000)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--grad_clip", type=float, default=1.0)
@@ -140,6 +140,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no_root_origin_shift", action="store_true")
     p.add_argument("--control_modes", default="none,root,endpoints,fullpose,mixed")
     p.add_argument("--max_control_keyframes", type=int, default=8)
+    p.add_argument("--endpoint_preset", choices=["kimodo_ee", "five_point"], default="kimodo_ee")
+    p.add_argument(
+        "--endpoint_subset_mode",
+        choices=["all", "random_nonempty"],
+        default="random_nonempty",
+    )
+    p.add_argument(
+        "--endpoint_root_ref_mode",
+        choices=["kimodo_hidden_root", "none"],
+        default="kimodo_hidden_root",
+    )
     p.add_argument("--flow_loss_weight", type=float, default=1.0)
     p.add_argument("--contact_loss_weight", type=float, default=0.1)
     p.add_argument("--control_cont_loss_weight", type=float, default=0.25)
@@ -204,6 +215,9 @@ def merge_config(args: argparse.Namespace, cfg: dict[str, Any]) -> argparse.Name
         "velocity_loss_weight": "loss.velocity",
         "control_modes": "control.modes",
         "max_control_keyframes": "control.max_keyframes",
+        "endpoint_preset": "control.endpoint_preset",
+        "endpoint_subset_mode": "control.endpoint_subset_mode",
+        "endpoint_root_ref_mode": "control.endpoint_root_ref_mode",
         "self_cond_train_prob": "self_conditioning.train_prob",
         "self_cond_mode": "self_conditioning.mode",
         "self_cond_scale": "self_conditioning.scale",
@@ -391,6 +405,80 @@ def save_checkpoint(
     os.replace(tmp_path, path)
 
 
+RESUME_CONTRACT_FIELDS = (
+    "data_root",
+    "text_root",
+    "max_frames",
+    "min_frames",
+    "prediction_type",
+    "hidden_dim",
+    "num_heads",
+    "depth_double",
+    "depth_single",
+    "mlp_ratio",
+    "dropout",
+    "text_encoder",
+    "max_text_tokens",
+    "hytext_cache_dir",
+    "hytext_ctxt_dim",
+    "hytext_vtxt_dim",
+    "text_dropout_prob",
+    "random_first_heading",
+    "root_origin_shift",
+    "self_conditioning",
+    "self_cond_mode",
+    "self_cond_scale",
+)
+
+
+def validate_resume_contract(args: argparse.Namespace, checkpoint_args: Any, path: str) -> None:
+    if not isinstance(checkpoint_args, dict):
+        raise RuntimeError(f"Checkpoint is missing its resolved args contract: {path}")
+    missing = [field for field in RESUME_CONTRACT_FIELDS if field not in checkpoint_args]
+    mismatches = [
+        (field, checkpoint_args[field], getattr(args, field))
+        for field in RESUME_CONTRACT_FIELDS
+        if field in checkpoint_args and checkpoint_args[field] != getattr(args, field)
+    ]
+    if missing or mismatches:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing fields={missing}")
+        if mismatches:
+            details.append(
+                "mismatches="
+                + ", ".join(
+                    f"{field}: checkpoint={saved!r}, requested={requested!r}"
+                    for field, saved, requested in mismatches
+                )
+            )
+        raise RuntimeError(f"Checkpoint resume contract mismatch for {path}: {'; '.join(details)}")
+
+
+def validate_ema_contract(
+    model_state: dict[str, Any], ema_state: Any, path: str
+) -> dict[str, Any]:
+    if not isinstance(ema_state, dict):
+        raise RuntimeError(f"EMA was requested but checkpoint has no EMA state: {path}")
+    model_keys = set(model_state)
+    ema_keys = set(ema_state)
+    missing = sorted(model_keys - ema_keys)
+    unexpected = sorted(ema_keys - model_keys)
+    shape_mismatches = sorted(
+        key
+        for key in model_keys & ema_keys
+        if torch.is_tensor(model_state[key])
+        and torch.is_tensor(ema_state[key])
+        and model_state[key].shape != ema_state[key].shape
+    )
+    if missing or unexpected or shape_mismatches:
+        raise RuntimeError(
+            f"Checkpoint EMA is incompatible for {path}: missing={missing}, "
+            f"unexpected={unexpected}, shape_mismatches={shape_mismatches}"
+        )
+    return ema_state
+
+
 @torch.no_grad()
 def init_ema_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     raw_model = model.module if isinstance(model, DDP) else model
@@ -438,8 +526,10 @@ def compute_step_loss(
         x0_un,
         lengths=lengths,
         modes=tuple(m.strip() for m in args.control_modes.split(",") if m.strip()),
+        endpoint_preset=args.endpoint_preset,
+        endpoint_subset_mode=args.endpoint_subset_mode,
         max_keyframes=args.max_control_keyframes,
-        include_root_ref_for_endpoints=True,
+        include_root_ref_for_endpoints=args.endpoint_root_ref_mode == "kimodo_hidden_root",
     )
     obs_un = controls.observed_motion
     motion_mask = controls.motion_mask.to(device=device)
@@ -627,15 +717,29 @@ def main() -> None:
     ema_state: dict[str, torch.Tensor] | None = None
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
+        validate_resume_contract(args, ckpt.get("args"), args.resume)
         raw_model = model.module if isinstance(model, DDP) else model
-        raw_model.load_state_dict(ckpt["model"], strict=False)
-        optimizer.load_state_dict(ckpt["optimizer"])
+        try:
+            raw_model.load_state_dict(ckpt["model"], strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Checkpoint model is incompatible with the requested architecture: {args.resume}"
+            ) from exc
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except (KeyError, RuntimeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Checkpoint optimizer is incompatible with the requested parameter groups: {args.resume}"
+            ) from exc
         start_epoch = int(ckpt.get("epoch", 0))
         global_step = int(ckpt.get("step", 0))
-        if bool(args.ema) and "ema" in ckpt:
+        if bool(args.ema):
+            checkpoint_ema = validate_ema_contract(
+                raw_model.state_dict(), ckpt.get("ema"), args.resume
+            )
             ema_state = {
                 key: value.to(device=device) if torch.is_tensor(value) else value
-                for key, value in ckpt["ema"].items()
+                for key, value in checkpoint_ema.items()
             }
     if bool(args.ema) and ema_state is None:
         ema_state = init_ema_state(model)

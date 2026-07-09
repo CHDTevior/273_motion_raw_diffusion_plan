@@ -55,7 +55,9 @@ This repository now includes the current HY273 raw-flow implementation snapshot 
 - `train_hy273_raw_flow.py`
 - `sample_hy273_raw.py`
 - `configs/raw_flow_hy273.yaml`
+- `configs/raw_flow_hy273_hytext.yaml`
 - `tools/cache_hy273_hytext_embeddings.py`
+- `tools/check_hy273_hytext_cache_coverage.py`
 - `scripts/launch/train_hy273_raw_flow_stage1_x0_hytext_ddp8.sh`
 - `tests/test_raw_flow_model.py`
 - `tests/test_raw_flow_sampling.py`

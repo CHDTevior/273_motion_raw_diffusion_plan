@@ -30,6 +30,7 @@ models/raw_motion/text_condition.py
 
 models/raw_motion/hytext_cache.py
   Memmap cache reader and CachedHYTextEncoder projection bridge.
+  The reader validates cache metadata and groups random batch lookups by shard.
 
 models/raw_motion/raw_flow_dit.py
   Adds text_encoder=hy_cache / hytext_cache / qwen_clip_cache.
@@ -37,11 +38,17 @@ models/raw_motion/raw_flow_dit.py
 tools/cache_hy273_hytext_embeddings.py
   Offline cache builder using local Qwen3-8B and CLIP ViT-L/14 weights.
 
+tools/check_hy273_hytext_cache_coverage.py
+  Verifies that train/val/test captions and the empty caption all hit the cache index.
+
 train_hy273_raw_flow.py
   Adds max_text_tokens and HYText cache args, saved into checkpoint args.
 
 sample_hy273_raw.py
   Adds HYText override args for sampling/eval.
+
+configs/raw_flow_hy273_hytext.yaml
+  Dedicated HYText-cache config for stage-1 training.
 
 scripts/launch/train_hy273_raw_flow_stage1_x0_hytext_ddp8.sh
   Stage-1 8-GPU launch script for HYText-cache T2M x0 training.
@@ -116,12 +123,25 @@ Raw-flow denoiser
   --clip_path /mnt/afs/HY-Motion-1.0/ckpts/clip-vit-large-patch14 \
   --max_length_llm 128 \
   --batch_size 4 \
-  --shard_size 128 \
+  --shard_size 4096 \
   --device cuda:0 \
   --storage_dtype fp16
 ```
 
 Use an actually idle GPU for this command. It loads Qwen3-8B once and writes a memmap cache.
+
+Before long training, run cache coverage:
+
+```bash
+/root/miniconda3/envs/mogo/bin/python tools/check_hy273_hytext_cache_coverage.py \
+  --data_root /mnt/afs/mogo_base/datasets/HumanML3D/kimodo273_from_hy201_smplx22 \
+  --text_root /mnt/afs/mogo_base/datasets/HumanML3D/texts \
+  --cache_dir /mnt/afs/mogo_base/datasets/HumanML3D/hytext_qwen3_clipL_mlen128 \
+  --splits train,val,test \
+  --output_json /mnt/afs/mogo_base/datasets/HumanML3D/hytext_qwen3_clipL_mlen128/coverage_report.json
+```
+
+This must pass with `empty_key_present=true` and no missing captions.
 
 ## Training Command
 
@@ -161,6 +181,32 @@ Passed one-step train smoke with fake cache:
 ```
 
 This smoke uses fake zero text cache with cache-miss fallback. It validates code connectivity only; it does not validate HYText quality.
+
+## Post-Review Fixes
+
+The follow-up patch addresses the high-priority review issues:
+
+```text
+P0:
+  - Added configs/raw_flow_hy273_hytext.yaml so HYText training does not rely on CLI overrides.
+  - train_hy273_raw_flow_stage1_x0_hytext_ddp8.sh now defaults CONFIG to the HYText config.
+  - Added tools/check_hy273_hytext_cache_coverage.py.
+  - CachedHYTextEncoder validates manifest format, ctxt/vtxt dims, max_length_llm, and first-shard array shape.
+
+P1:
+  - cache builder shard_size default changed 128 -> 4096.
+  - hytext_max_open_shards default changed to 64 in configs.
+  - HYTextMemmapCache.lookup_rows now groups random batch rows by shard and vector-indexes each shard.
+  - sample_hy273_raw.py can override hytext_ctxt_dim, hytext_vtxt_dim, hytext_max_open_shards, and hytext_allow_cache_miss.
+```
+
+Remaining known issue:
+
+```text
+HumanML3D segment-caption span handling is still unchanged.
+The current dataset keeps the existing full-caption/random-crop behavior.
+Treat this as a quality ablation after the HYText cache pilot starts.
+```
 
 ## Reviewer Prompt
 

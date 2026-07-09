@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export RUN_NAME="${RUN_NAME:-hy273_raw_flow_hml3d_stage1_x0_hytext_sem_ddp8_$(date +%Y%m%d_%H%M%S)}"
 export MASTER_PORT="${MASTER_PORT:-29711}"
 export HYTEXT_CACHE_DIR="${HYTEXT_CACHE_DIR:-/mnt/afs/mogo_base/datasets/HumanML3D/hytext_qwen3_clipL_mlen128}"
+export CONFIG="${CONFIG:-configs/raw_flow_hy273_hytext.yaml}"
 
 "${SCRIPT_DIR}/train_hy273_raw_flow_ddp8.sh" \
   --prediction_type x0 \

@@ -15,12 +15,13 @@ TEXT_ROOT="${TEXT_ROOT:-/mnt/afs/mogo_base/datasets/HumanML3D/texts}"
 CLIP_PATH="${CLIP_PATH:-${REPO_ROOT}/checkpoints/clip/ViT-B-32.pt}"
 RUN_NAME="${RUN_NAME:-hy273_raw_flow_hml3d_ddp8_$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/t2m}"
+CONFIG="${CONFIG:-configs/raw_flow_hy273.yaml}"
 
 "${PYTHON_BIN}" -m torch.distributed.run \
   --nproc_per_node "${NUM_GPUS}" \
   --master_port "${MASTER_PORT}" \
   train_hy273_raw_flow.py \
-  --config configs/raw_flow_hy273.yaml \
+  --config "${CONFIG}" \
   --name "${RUN_NAME}" \
   --output_dir "${OUT_DIR}" \
   --data_root "${DATA_ROOT}" \

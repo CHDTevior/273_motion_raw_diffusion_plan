@@ -37,12 +37,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--clip_path", default="/mnt/afs/HY-Motion-1.0/ckpts/clip-vit-large-patch14")
     p.add_argument("--max_length_llm", type=int, default=128)
     p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--shard_size", type=int, default=128)
+    p.add_argument("--shard_size", type=int, default=4096)
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--model_dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--storage_dtype", choices=["fp16", "fp32"], default="fp16")
-    p.add_argument("--include_empty", action="store_true", default=True)
+    p.add_argument("--include_empty", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--overwrite", action="store_true")
     return p
 

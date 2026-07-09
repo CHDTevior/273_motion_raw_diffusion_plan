@@ -153,6 +153,10 @@ def main() -> None:
     parser.add_argument("--anchor_first_frame", action="store_true")
     parser.add_argument("--text_encoder", choices=["clip", "hy_cache", "hytext_cache", "qwen_clip_cache", "none"], default="")
     parser.add_argument("--hytext_cache_dir", default="")
+    parser.add_argument("--hytext_ctxt_dim", type=int, default=0)
+    parser.add_argument("--hytext_vtxt_dim", type=int, default=0)
+    parser.add_argument("--hytext_max_open_shards", type=int, default=0)
+    parser.add_argument("--hytext_allow_cache_miss", action="store_true")
     args = parser.parse_args()
     torch.manual_seed(int(args.seed))
     np.random.seed(int(args.seed) % (2**32 - 1))
@@ -166,6 +170,14 @@ def main() -> None:
         train_args.text_encoder = args.text_encoder
     if args.hytext_cache_dir:
         train_args.hytext_cache_dir = args.hytext_cache_dir
+    if args.hytext_ctxt_dim > 0:
+        train_args.hytext_ctxt_dim = args.hytext_ctxt_dim
+    if args.hytext_vtxt_dim > 0:
+        train_args.hytext_vtxt_dim = args.hytext_vtxt_dim
+    if args.hytext_max_open_shards > 0:
+        train_args.hytext_max_open_shards = args.hytext_max_open_shards
+    if args.hytext_allow_cache_miss:
+        train_args.hytext_allow_cache_miss = True
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = create_model(train_args).to(device)
     weight_source = args.weight_source

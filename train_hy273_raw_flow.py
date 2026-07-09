@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -170,7 +171,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def merge_config(args: argparse.Namespace, cfg: dict[str, Any]) -> argparse.Namespace:
+def explicit_cli_destinations(
+    parser: argparse.ArgumentParser, argv: list[str]
+) -> set[str]:
+    destinations: set[str] = set()
+    for token in argv:
+        if token == "--":
+            break
+        option = token.split("=", 1)[0]
+        action = parser._option_string_actions.get(option)
+        if action is not None:
+            destinations.add(action.dest)
+    return destinations
+
+
+def merge_config(
+    args: argparse.Namespace,
+    cfg: dict[str, Any],
+    explicit_cli: set[str] | None = None,
+) -> argparse.Namespace:
     defaults = {
         "data_root": "data.data_root",
         "text_root": "data.text_root",
@@ -222,9 +241,10 @@ def merge_config(args: argparse.Namespace, cfg: dict[str, Any]) -> argparse.Name
         "self_cond_mode": "self_conditioning.mode",
         "self_cond_scale": "self_conditioning.scale",
     }
+    explicit_cli = explicit_cli or set()
     parser_defaults = vars(build_arg_parser().parse_args([]))
     for attr, path in defaults.items():
-        if getattr(args, attr) == parser_defaults[attr]:
+        if attr not in explicit_cli and getattr(args, attr) == parser_defaults[attr]:
             setattr(args, attr, flatten_get(cfg, path, getattr(args, attr)))
     if not args.self_conditioning:
         args.self_conditioning = bool(flatten_get(cfg, "self_conditioning.enabled", False))
@@ -408,8 +428,22 @@ def save_checkpoint(
 RESUME_CONTRACT_FIELDS = (
     "data_root",
     "text_root",
+    "split",
+    "seed",
     "max_frames",
     "min_frames",
+    "batch_size",
+    "lr",
+    "weight_decay",
+    "grad_clip",
+    "amp",
+    "amp_dtype",
+    "ema",
+    "ema_decay",
+    "ema_every",
+    "time_schedule",
+    "denoiser_p_mean",
+    "denoiser_p_std",
     "prediction_type",
     "hidden_dim",
     "num_heads",
@@ -422,12 +456,24 @@ RESUME_CONTRACT_FIELDS = (
     "hytext_cache_dir",
     "hytext_ctxt_dim",
     "hytext_vtxt_dim",
+    "hytext_allow_cache_miss",
     "text_dropout_prob",
     "random_first_heading",
     "root_origin_shift",
     "self_conditioning",
+    "self_cond_train_prob",
     "self_cond_mode",
     "self_cond_scale",
+    "flow_loss_weight",
+    "contact_loss_weight",
+    "clean_cont_loss_weight",
+    "clean_root_vel_loss_weight",
+    "clean_joint_vel_loss_weight",
+    "foot_lock_loss_weight",
+    "semantic_loss_fps",
+    "foot_lock_contact_threshold",
+    "root_heading_loss_weight",
+    "velocity_loss_weight",
 )
 
 
@@ -673,9 +719,11 @@ def compute_step_loss(
 
 def main() -> None:
     parser = build_arg_parser()
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    explicit_cli = explicit_cli_destinations(parser, argv)
+    args = parser.parse_args(argv)
     cfg = load_yaml(args.config)
-    args = merge_config(args, cfg)
+    args = merge_config(args, cfg, explicit_cli=explicit_cli)
     if not args.data_root:
         raise ValueError("--data_root is required")
     device, rank, world, local_rank = setup_distributed()

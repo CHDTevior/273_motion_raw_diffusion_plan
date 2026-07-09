@@ -15,7 +15,14 @@ from models.raw_motion.hy273_slices import (
     ROOT_SLICE,
     joint_pos_slice_for,
 )
-from train_hy273_raw_flow import validate_ema_contract, validate_resume_contract
+from sample_hy273_raw import resolve_endpoint_protocol
+from train_hy273_raw_flow import (
+    build_arg_parser,
+    explicit_cli_destinations,
+    merge_config,
+    validate_ema_contract,
+    validate_resume_contract,
+)
 
 
 def _selected_joint_ids(mask_at_frame: torch.Tensor) -> tuple[int, ...]:
@@ -109,38 +116,80 @@ def test_endpoint_root_reference_can_only_be_disabled_explicitly() -> None:
 
 
 def test_resume_contract_rejects_shape_preserving_text_semantic_change() -> None:
-    requested = Namespace(
-        data_root="/data",
-        text_root="/text",
-        max_frames=300,
-        min_frames=16,
-        prediction_type="x0",
-        hidden_dim=1024,
-        num_heads=8,
-        depth_double=6,
-        depth_single=12,
-        mlp_ratio=2.0,
-        dropout=0.0,
-        text_encoder="hy_cache",
-        max_text_tokens=128,
-        hytext_cache_dir="/cache",
-        hytext_ctxt_dim=4096,
-        hytext_vtxt_dim=768,
-        text_dropout_prob=0.1,
-        random_first_heading=True,
-        root_origin_shift=True,
-        self_conditioning=False,
-        self_cond_mode="add_proj",
-        self_cond_scale=1.0,
-    )
+    requested = build_arg_parser().parse_args([])
+    requested.data_root = "/data"
+    requested.text_root = "/text"
+    requested.text_encoder = "hy_cache"
+    requested.max_text_tokens = 128
+    requested.hytext_cache_dir = "/cache"
+    requested.random_first_heading = True
+    requested.root_origin_shift = True
     saved = vars(requested).copy()
     validate_resume_contract(requested, saved, "checkpoint.pt")
-    saved["max_text_tokens"] = 50
-    with pytest.raises(RuntimeError, match="max_text_tokens"):
-        validate_resume_contract(requested, saved, "checkpoint.pt")
+    for field, changed in (
+        ("max_text_tokens", 50),
+        ("split", "val"),
+        ("time_schedule", "uniform"),
+        ("hytext_allow_cache_miss", True),
+    ):
+        incompatible = saved.copy()
+        incompatible[field] = changed
+        with pytest.raises(RuntimeError, match=field):
+            validate_resume_contract(requested, incompatible, "checkpoint.pt")
 
 
 def test_ema_contract_rejects_missing_parameter() -> None:
     model_state = {"a": torch.zeros(2), "b": torch.zeros(3)}
     with pytest.raises(RuntimeError, match="missing=.*b"):
         validate_ema_contract(model_state, {"a": torch.zeros(2)}, "checkpoint.pt")
+
+
+def test_explicit_cli_default_value_overrides_conflicting_yaml() -> None:
+    parser = build_arg_parser()
+    argv = [
+        "--control_modes",
+        "none,root,endpoints,fullpose,mixed",
+        "--endpoint_subset_mode",
+        "random_nonempty",
+    ]
+    args = parser.parse_args(argv)
+    cfg = {
+        "control": {
+            "modes": ["none"],
+            "endpoint_subset_mode": "all",
+        }
+    }
+    merged = merge_config(
+        args,
+        cfg,
+        explicit_cli=explicit_cli_destinations(parser, argv),
+    )
+    assert merged.control_modes == "none,root,endpoints,fullpose,mixed"
+    assert merged.endpoint_subset_mode == "random_nonempty"
+
+
+def test_sampling_reuses_checkpoint_endpoint_protocol_and_allows_override() -> None:
+    checkpoint_args = Namespace(
+        endpoint_preset="five_point",
+        endpoint_subset_mode="all",
+        endpoint_root_ref_mode="none",
+        max_control_keyframes=5,
+    )
+    inherited = resolve_endpoint_protocol(checkpoint_args)
+    assert inherited == {
+        "endpoint_preset": "five_point",
+        "endpoint_subset_mode": "all",
+        "endpoint_root_ref_mode": "none",
+        "max_control_keyframes": 5,
+        "include_root_ref_for_endpoints": False,
+    }
+    overridden = resolve_endpoint_protocol(
+        checkpoint_args,
+        endpoint_preset="kimodo_ee",
+        endpoint_subset_mode="random_nonempty",
+        endpoint_root_ref_mode="kimodo_hidden_root",
+        max_control_keyframes=8,
+    )
+    assert overridden["endpoint_preset"] == "kimodo_ee"
+    assert overridden["endpoint_subset_mode"] == "random_nonempty"
+    assert overridden["include_root_ref_for_endpoints"] is True

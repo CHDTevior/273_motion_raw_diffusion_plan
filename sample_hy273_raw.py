@@ -133,6 +133,30 @@ def anchor_first_frame_convention(
     return observed_un, motion_mask
 
 
+def resolve_endpoint_protocol(
+    train_args: argparse.Namespace,
+    endpoint_preset: str = "",
+    endpoint_subset_mode: str = "",
+    endpoint_root_ref_mode: str = "",
+    max_control_keyframes: int = 0,
+) -> dict[str, object]:
+    root_ref_mode = endpoint_root_ref_mode or str(
+        getattr(train_args, "endpoint_root_ref_mode", "kimodo_hidden_root")
+    )
+    return {
+        "endpoint_preset": endpoint_preset
+        or str(getattr(train_args, "endpoint_preset", "kimodo_ee")),
+        "endpoint_subset_mode": endpoint_subset_mode
+        or str(getattr(train_args, "endpoint_subset_mode", "random_nonempty")),
+        "endpoint_root_ref_mode": root_ref_mode,
+        "max_control_keyframes": int(
+            max_control_keyframes
+            or int(getattr(train_args, "max_control_keyframes", 8))
+        ),
+        "include_root_ref_for_endpoints": root_ref_mode == "kimodo_hidden_root",
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
@@ -149,6 +173,18 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--weight_source", choices=["auto", "model", "ema"], default="auto")
     parser.add_argument("--control_modes", default="root,endpoints,fullpose,mixed")
+    parser.add_argument("--endpoint_preset", choices=["kimodo_ee", "five_point"], default="")
+    parser.add_argument(
+        "--endpoint_subset_mode",
+        choices=["all", "random_nonempty"],
+        default="",
+    )
+    parser.add_argument(
+        "--endpoint_root_ref_mode",
+        choices=["kimodo_hidden_root", "none"],
+        default="",
+    )
+    parser.add_argument("--max_control_keyframes", type=int, default=0)
     parser.add_argument("--c_dir_mode", choices=["dataset", "forward"], default="dataset")
     parser.add_argument("--anchor_first_frame", action="store_true")
     parser.add_argument("--text_encoder", choices=["clip", "hy_cache", "hytext_cache", "qwen_clip_cache", "none"], default="")
@@ -203,12 +239,23 @@ def main() -> None:
     lengths = batch["lengths"].to(device)
     transform = apply_kimodo_training_transform(motion, random_heading=False, root_shift=True)
     motion = transform.motion
+    endpoint_protocol = resolve_endpoint_protocol(
+        train_args,
+        endpoint_preset=args.endpoint_preset,
+        endpoint_subset_mode=args.endpoint_subset_mode,
+        endpoint_root_ref_mode=args.endpoint_root_ref_mode,
+        max_control_keyframes=args.max_control_keyframes,
+    )
     controls = build_synthetic_control_batch(
         motion,
         lengths,
         modes=tuple(m.strip() for m in args.control_modes.split(",") if m.strip()),
-        max_keyframes=8,
-        include_root_ref_for_endpoints=True,
+        endpoint_preset=str(endpoint_protocol["endpoint_preset"]),
+        endpoint_subset_mode=str(endpoint_protocol["endpoint_subset_mode"]),
+        max_keyframes=int(endpoint_protocol["max_control_keyframes"]),
+        include_root_ref_for_endpoints=bool(
+            endpoint_protocol["include_root_ref_for_endpoints"]
+        ),
     )
     if args.c_dir_mode == "forward":
         c_dir = torch.zeros(motion.shape[0], 2, device=device, dtype=motion.dtype)
@@ -260,6 +307,7 @@ def main() -> None:
                 "texts": batch["texts"],
                 "rel_paths": batch["rel_paths"],
                 "control_modes": controls.mode_ids,
+                "endpoint_protocol": endpoint_protocol,
                 "c_dir_mode": args.c_dir_mode,
                 "anchor_first_frame": bool(args.anchor_first_frame),
             },

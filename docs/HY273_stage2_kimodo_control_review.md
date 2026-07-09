@@ -64,7 +64,7 @@ python -m pytest -q \
   tests/test_raw_flow_model.py \
   tests/test_raw_flow_sampling.py
 
-16 passed
+17 passed
 ```
 
 The Stage-2 launcher was also dry-run through `/bin/echo`. It resolved to HYText cache, 128 text tokens, Kimodo logical subsets, 10,000 maximum epochs, total step 1.5M, and 50K checkpoint intervals.
@@ -74,6 +74,8 @@ The first `gpt-5.6-sol` / `max` adversarial review found three P2 consistency ga
 1. Extends the resume contract to data split, random seed, optimizer/numerical settings, flow time distribution, HYText cache strictness, self-conditioning probability, and unchanged Stage-1 loss semantics.
 2. Makes sampling inherit the checkpoint endpoint preset, subset mode, root-reference mode, and keyframe count, with explicit sampling overrides available.
 3. Tracks which argparse destinations were explicitly present so command-line values always override YAML, even when equal to parser defaults.
+
+The follow-up review found one P2 edge case: argparse accepted abbreviated option names that the explicit-option detector did not recognize. The training parser now disables option abbreviation, so only exact CLI names are accepted and YAML precedence cannot diverge from parsing. A regression test covers the rejected abbreviation.
 
 ## Reviewer Prompt
 

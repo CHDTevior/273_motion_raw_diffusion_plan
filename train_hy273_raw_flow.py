@@ -89,7 +89,9 @@ def seed_all(seed: int, rank: int) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser()
+    # Config precedence depends on exact option identities, so accepting argparse
+    # abbreviations would let a parsed CLI value be mistaken for an absent option.
+    p = argparse.ArgumentParser(allow_abbrev=False)
     p.add_argument("--config", default="configs/raw_flow_hy273.yaml")
     p.add_argument("--data_root", default="")
     p.add_argument("--text_root", default="")

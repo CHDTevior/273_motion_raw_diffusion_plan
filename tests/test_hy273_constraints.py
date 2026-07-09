@@ -168,6 +168,12 @@ def test_explicit_cli_default_value_overrides_conflicting_yaml() -> None:
     assert merged.endpoint_subset_mode == "random_nonempty"
 
 
+def test_training_cli_rejects_abbreviated_options() -> None:
+    parser = build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--endpoint_subset", "random_nonempty"])
+
+
 def test_sampling_reuses_checkpoint_endpoint_protocol_and_allows_override() -> None:
     checkpoint_args = Namespace(
         endpoint_preset="five_point",

@@ -36,3 +36,28 @@ def test_sample_ode_clamps_observed_dims():
     )
     assert out.shape == (2, 6, 273)
     assert torch.allclose(out[:, 0, :5].cpu(), obs[:, 0, :5])
+
+
+def test_sample_ode_uses_numerical_velocity_epsilon():
+    model = HY273RawFlow(
+        hidden_dim=64,
+        num_heads=4,
+        depth_double=1,
+        depth_single=1,
+        text_encoder="none",
+    )
+    normalizer = HY273Normalizer(torch.zeros(273), torch.ones(273))
+    out = sample_ode(
+        model,
+        normalizer,
+        torch.tensor([4]),
+        ["walk"],
+        torch.zeros(1, 4, 273),
+        torch.zeros(1, 4, 273, dtype=torch.bool),
+        c_dir=torch.tensor([[1.0, 0.0]]),
+        num_steps=2,
+        prediction_type="x0",
+        velocity_t_eps=1e-4,
+    )
+    assert out.shape == (1, 4, 273)
+    assert torch.isfinite(out).all()

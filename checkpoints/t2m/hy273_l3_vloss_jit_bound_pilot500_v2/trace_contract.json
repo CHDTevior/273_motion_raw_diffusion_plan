@@ -1,0 +1,26 @@
+{
+  "cuda_visible_devices": "0,1,2,3",
+  "effective_global_batch": 128,
+  "expected_resume_step": -1,
+  "format": "hy273_stateless_trace_v1",
+  "gradient_accumulation_steps": 2,
+  "initial_model_sha256": "808a1639f7ec134887ce07b3d2634849dccfe68e6441bac0addba4f4cc579e59",
+  "master_port": "29833",
+  "microbatch_per_rank": 16,
+  "resume_epoch": 0,
+  "resume_sha256": "",
+  "resume_step_in_epoch": 0,
+  "source_manifest_sha256": "0b5bce3116b0eb2e4b89ab78223b853e27473c631c78e036d7c80fed23a8a0e5",
+  "streams": [
+    "random_heading",
+    "control",
+    "timestep",
+    "continuous_noise",
+    "contact_aux",
+    "self_conditioning",
+    "text_dropout"
+  ],
+  "trace_hash_steps": 100,
+  "trace_seed": 3407,
+  "world_size": 4
+}

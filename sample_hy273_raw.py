@@ -15,7 +15,12 @@ from models.raw_motion.flow_schedule import make_ode_grid
 from models.raw_motion.hy273_constraints import build_synthetic_control_batch
 from models.raw_motion.hy273_normalizer import HY273Normalizer, apply_kimodo_training_transform
 from models.raw_motion.hy273_slices import CONTACT_SLICE, CONT_DIM, HEADING_SLICE, ROOT_SLICE
-from train_hy273_raw_flow import create_model, predict_clean_cont, prediction_velocity_cont
+from train_hy273_raw_flow import (
+    create_model,
+    predict_clean_cont,
+    prediction_velocity_cont,
+    resolve_representation_loss_space,
+)
 
 
 @torch.no_grad()
@@ -34,6 +39,7 @@ def sample_ode(
     contact_feedback: str = "blend",
     cfg_apply_contacts: bool = False,
     prediction_type: str = "velocity",
+    velocity_t_eps: float = 1e-4,
 ) -> torch.Tensor:
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
@@ -91,7 +97,14 @@ def sample_ode(
         pred_cont = pred[..., :CONT_DIM]
         contact_prob = torch.sigmoid(pred[..., CONTACT_SLICE])
         x0_hat_cont = predict_clean_cont(state[..., :CONT_DIM], t, pred_cont, prediction_type)
-        v_cont = prediction_velocity_cont(state[..., :CONT_DIM], t, pred_cont, x0_hat_cont, prediction_type)
+        v_cont = prediction_velocity_cont(
+            state[..., :CONT_DIM],
+            t,
+            pred_cont,
+            x0_hat_cont,
+            prediction_type,
+            velocity_t_eps=velocity_t_eps,
+        )
         x0_hat = torch.cat([x0_hat_cont, contact_prob], dim=-1)
         x0_hat_clamped = x0_hat * (1.0 - motion_mask) + observed * motion_mask
         z_cont_next = state[..., :CONT_DIM] + dt * v_cont
@@ -165,6 +178,11 @@ def main() -> None:
     parser.add_argument("--split", default="test")
     parser.add_argument("--output_dir", default="generation/hy273_raw_flow")
     parser.add_argument("--num_samples", type=int, default=16)
+    parser.add_argument(
+        "--indices",
+        default="",
+        help="Comma-separated dataset indices to sample. Defaults to the first --num_samples items.",
+    )
     parser.add_argument("--num_steps", type=int, default=32)
     parser.add_argument("--cfg_scale", type=float, default=1.0)
     parser.add_argument("--contact_init", choices=["random", "zeros", "half"], default="random")
@@ -233,7 +251,16 @@ def main() -> None:
         random_crop=False,
         deterministic_text=True,
     )
-    samples = [dataset[i] for i in range(min(args.num_samples, len(dataset)))]
+    if args.indices:
+        sample_indices = [int(part.strip()) for part in args.indices.split(",") if part.strip()]
+        if not sample_indices:
+            raise ValueError("--indices was provided but no valid indices were parsed")
+        for idx in sample_indices:
+            if idx < 0 or idx >= len(dataset):
+                raise IndexError(f"Dataset index {idx} out of range for split {args.split} with {len(dataset)} items")
+    else:
+        sample_indices = list(range(min(args.num_samples, len(dataset))))
+    samples = [dataset[i] for i in sample_indices]
     batch = collate_kimodo273_text(samples)
     motion = batch["motion"].to(device)
     lengths = batch["lengths"].to(device)
@@ -268,6 +295,14 @@ def main() -> None:
             controls.motion_mask,
             c_dir,
         )
+    prediction_type = str(getattr(train_args, "prediction_type", "velocity"))
+    representation_loss_space = resolve_representation_loss_space(
+        prediction_type,
+        str(getattr(train_args, "representation_loss_space", "auto")),
+    )
+    # The JiT epsilon caps the training loss weight only. ODE integration must
+    # retain the rectified-flow vector field and uses only a numerical floor.
+    sampling_velocity_t_eps = 1e-4
     pred = sample_ode(
         model,
         normalizer,
@@ -282,7 +317,8 @@ def main() -> None:
         contact_init=args.contact_init,
         contact_feedback=args.contact_feedback,
         cfg_apply_contacts=bool(args.cfg_apply_contacts),
-        prediction_type=str(getattr(train_args, "prediction_type", "velocity")),
+        prediction_type=prediction_type,
+        velocity_t_eps=sampling_velocity_t_eps,
     )
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -303,9 +339,15 @@ def main() -> None:
                 "seed": int(args.seed),
                 "weight_source": weight_source,
                 "prediction_type": str(getattr(train_args, "prediction_type", "velocity")),
+                "representation_loss_space": representation_loss_space,
+                "velocity_loss_t_eps": float(
+                    getattr(train_args, "velocity_loss_t_eps", 0.05)
+                ),
+                "sampling_velocity_t_eps": sampling_velocity_t_eps,
                 "lengths": lengths_np.tolist(),
                 "texts": batch["texts"],
                 "rel_paths": batch["rel_paths"],
+                "indices": sample_indices,
                 "control_modes": controls.mode_ids,
                 "endpoint_protocol": endpoint_protocol,
                 "c_dir_mode": args.c_dir_mode,

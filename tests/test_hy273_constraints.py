@@ -130,12 +130,36 @@ def test_resume_contract_rejects_shape_preserving_text_semantic_change() -> None
         ("max_text_tokens", 50),
         ("split", "val"),
         ("time_schedule", "uniform"),
+        ("representation_loss_space", "velocity"),
+        ("velocity_loss_t_eps", 0.01),
+        ("source_manifest_sha256", "different-manifest"),
         ("hytext_allow_cache_miss", True),
     ):
         incompatible = saved.copy()
         incompatible[field] = changed
         with pytest.raises(RuntimeError, match=field):
             validate_resume_contract(requested, incompatible, "checkpoint.pt")
+
+
+def test_strict_resume_requires_v2_objective_and_source_contract() -> None:
+    requested = build_arg_parser().parse_args([])
+    saved = vars(requested).copy()
+    legacy_fields = (
+        "resume_contract_version",
+        "representation_loss_space",
+        "velocity_loss_t_eps",
+        "source_manifest_sha256",
+    )
+    for field in legacy_fields:
+        saved.pop(field)
+    with pytest.raises(RuntimeError, match="missing fields"):
+        validate_resume_contract(requested, saved, "legacy.pt")
+    validate_resume_contract(
+        requested,
+        saved,
+        "legacy.pt",
+        allowed_missing_fields=legacy_fields,
+    )
 
 
 def test_ema_contract_rejects_missing_parameter() -> None:

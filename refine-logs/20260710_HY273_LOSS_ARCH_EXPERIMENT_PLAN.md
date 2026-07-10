@@ -235,6 +235,48 @@ Promotion gate:
 
 L3 的增量结论必须直接对 L2 做 paired comparison；若 consistency 指标改善但 motion/text/skate 退化，则选择 L2。
 
+## B1.5: User-Directed L3 Clean-Head JiT V-Loss Comparator
+
+After the 100K visual review, the user selected L3 over L2 and requested a second
+independent L3 run using the clean-prediction/velocity-loss recipe from JiT. L2
+was stopped at approximately 137K; its durable 50K and 100K checkpoints remain
+archived. The original L3 run continues unchanged on GPU 4-7.
+
+The new comparator starts from random initialization on GPU 0-3 and keeps L3's
+data, architecture, HYText conditioning, semantic block weights, FK consistency,
+optimizer, LR, global batch 128, EMA, 200K budget, and 50K checkpoint cadence.
+Its changed denoising contract is:
+
+```text
+z_t      = t * x0 + (1 - t) * noise
+x0_hat   = model(z_t, t, text)
+v_target = (x0 - z_t)     / max(1 - t, 0.05)
+v_pred   = (x0_hat - z_t) / max(1 - t, 0.05)
+L_repr   = semantic_weighted_MSE(v_pred, v_target)
+
+t = sigmoid(N(P_mean=-0.8, P_std=0.8))
+```
+
+The timestep distribution and `t_eps=0.05` follow the public JiT implementation.
+This is therefore a JiT-recipe comparator, not a strict loss-only ablation against
+the original L3, which uses `logit-N(0,1)` and x0-space MSE.
+
+Pre-optimizer calibration on 4096 real HumanML3D samples fixed:
+
+```text
+representation_scale = 0.09397019716051493
+FK lambda             = 0.07
+aggregate FK gradient ratio = 7.044%
+worst fixed-timestep ratio  = 8.006%
+initial model SHA256         = 808a1639f7ec134887ce07b3d2634849dccfe68e6441bac0addba4f4cc579e59
+```
+
+A real-cache DDP4 500-step pilot is a mandatory launch gate. It completed with
+500 finite logged steps, zero gradient-clipping hits, gradient-norm p95/p99/max
+of 0.495/0.704/0.956, and flow loss decreasing from 0.391 at step 1 to 0.0207 at
+step 500. The machine-readable gate is
+`run_logs/hy273_l3_vloss_jit_preflight_report.json`.
+
 ## Deferred: Multi-Seed Loss Confirmation
 
 - 当前 L2/L3 已经是 seed 3407 的独立 scratch runs。本节仅保留未来的多训练 seed 复核，不再把当前实验描述成 continuation。

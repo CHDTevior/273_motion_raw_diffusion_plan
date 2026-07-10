@@ -8,8 +8,10 @@
 | R-B0-RESTART | B0 | exact checkpoint continuation | step-100 save, cursor, resume to 101 | scratch | 101 | 3407 | MUST | DONE |
 | R-B0-REVIEW | B0 | adversarial implementation review | gpt-5.6-sol max | scratch | 0 | fixed | MUST | GO |
 | R-M0-EVAL | B0 | finish evaluator before model selection | EMA/raw, FK skate, contact, motion, text bridge | n/a | 0 | fixed eval | MUST | IN_PROGRESS |
-| R-L2 | M1 | selected semantic recipe | weighted-block MSE, GPU0-3, DDP4, accum2 | scratch | 200K | 3407 | MUST | RUNNING |
+| R-L2 | M1 | selected semantic recipe | weighted-block MSE, GPU0-3, DDP4, accum2 | scratch | 137K observed / 100K durable | 3407 | MUST | STOPPED_BY_USER |
 | R-L3 | M1 | consistency increment | L2 + FK consistency, GPU4-7, DDP4, accum2 | scratch | 200K | 3407 | MUST | RUNNING |
+| R-L3-V-PREFLIGHT | M1.5 | validate clean-head JiT v-loss | source-bound real-cache DDP4, exact 500-step log/trace gate | scratch | 500 | 3407 | MUST | DONE |
+| R-L3-V | M1.5 | JiT-recipe comparator | L3 + x0 head/v-space loss + JiT t distribution, GPU0-3 | scratch | 200K | 3407 | MUST | READY_TO_LAUNCH |
 | R-S-MULTI | deferred | multi-seed loss confirmation | provisional winner | scratch | 50K | 3407/3408/3409 | DEFERRED | NOT_SCHEDULED |
 | R-A1 | M2 | architecture baseline | current one-stage + confirmed loss | scratch | 50K screen | 3407 | MUST | BLOCKED_BY_M1.5 |
 | R-A2 | M2 | root-body hypothesis | interleaved two-stage + confirmed loss | scratch | 50K screen | 3407 | MUST | BLOCKED_BY_M1.5 |
@@ -45,3 +47,8 @@
 - Each run targets 200K optimizer steps and saves at 50K, 100K, 150K, and 200K while atomically updating `latest.pt`.
 - Production pair: `hy273_l2_scratch200k_ddp4_20260710_103509` and `hy273_l3_scratch200k_ddp4_20260710_103509`.
 - Production first-100-step audit: both initial SHA values match calibration; all four paired rank traces are byte-identical.
+- L3 clean-head JiT v-loss calibration: `run_logs/hy273_l3_vloss_jitpm08ps08_calibration_train_t_seed3407_n4096.json`.
+- L3 clean-head JiT v-loss fixed-bin audit: `run_logs/hy273_l3_vloss_jitpm08ps08_calibration_bins_seed3407_n16_alpha0939702.json`.
+- L3 clean-head JiT v-loss pilot gate: `run_logs/hy273_l3_vloss_jit_preflight_report.json` (`passed: true`, source manifest `0b5bce3116b0eb2e4b89ab78223b853e27473c631c78e036d7c80fed23a8a0e5`).
+- Bound pilot: `hy273_l3_vloss_jit_bound_pilot500_v2`; all 500 train rows and four 100-row rank traces passed, with 0/500 clipping hits and flow mean decreasing from `0.20676698` (first 50) to `0.02048116` (last 50).
+- Final adversarial launch review: `logs/codex_gpt56sol_max_l3_vloss_pilot_logging_r3.txt` (`gpt-5.6-sol`, `max`; GO with no P0/P1).

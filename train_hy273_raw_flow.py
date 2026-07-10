@@ -188,6 +188,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="per_entry",
     )
     p.add_argument("--representation_loss_scale", type=float, default=1.0)
+    p.add_argument(
+        "--representation_loss_space",
+        choices=["auto", "x0", "velocity"],
+        default="auto",
+        help=(
+            "Space used by the continuous representation loss. 'auto' preserves the "
+            "legacy behavior: x0 loss for x0 prediction and velocity loss for velocity prediction."
+        ),
+    )
+    p.add_argument(
+        "--velocity_loss_t_eps",
+        type=float,
+        default=0.05,
+        help="Clamp for 1-t when an x0 prediction is transformed into velocity loss space.",
+    )
     p.add_argument("--fk_consistency_loss_weight", type=float, default=0.0)
     p.add_argument("--fk_consistency_scale_m", type=float, default=0.05)
     p.add_argument("--fk_consistency_warmup_steps", type=int, default=0)
@@ -201,10 +216,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--require_exact_resume_cursor", action="store_true")
     p.add_argument("--resume_sha256", default="")
     p.add_argument("--expected_initial_model_sha256", default="")
+    p.add_argument("--source_manifest_sha256", default="")
     p.add_argument("--self_conditioning", action="store_true")
     p.add_argument("--self_cond_train_prob", type=float, default=0.5)
     p.add_argument("--self_cond_mode", default="add_proj")
     p.add_argument("--self_cond_scale", type=float, default=1.0)
+    p.set_defaults(resume_contract_version=2)
     return p
 
 
@@ -238,7 +255,11 @@ def merge_config(
         "max_steps": "train.max_steps",
         "lr": "train.lr",
         "weight_decay": "train.weight_decay",
+        "grad_clip": "train.grad_clip",
         "gradient_accumulation_steps": "train.gradient_accumulation_steps",
+        "time_schedule": "train.time_schedule",
+        "denoiser_p_mean": "train.denoiser_p_mean",
+        "denoiser_p_std": "train.denoiser_p_std",
         "prediction_type": "model.prediction_type",
         "hidden_dim": "model.hidden_dim",
         "num_heads": "model.num_heads",
@@ -272,6 +293,8 @@ def merge_config(
         "velocity_loss_weight": "loss.velocity",
         "representation_loss_mode": "loss.representation_mode",
         "representation_loss_scale": "loss.representation_scale",
+        "representation_loss_space": "loss.representation_space",
+        "velocity_loss_t_eps": "loss.velocity_t_eps",
         "fk_consistency_loss_weight": "loss.fk_consistency",
         "fk_consistency_scale_m": "loss.fk_consistency_scale_m",
         "fk_consistency_warmup_steps": "loss.fk_consistency_warmup_steps",
@@ -428,13 +451,59 @@ def prediction_velocity_cont(
     pred_cont: torch.Tensor,
     x0_hat_cont: torch.Tensor,
     prediction_type: str,
+    velocity_t_eps: float = 1e-4,
 ) -> torch.Tensor:
     if prediction_type == "velocity":
         return pred_cont
     if prediction_type == "x0":
+        if velocity_t_eps <= 0:
+            raise ValueError(f"velocity_t_eps must be positive, got {velocity_t_eps}")
         t_view = t.view(-1, 1, 1).to(device=z_cont_imp.device, dtype=z_cont_imp.dtype)
-        return (x0_hat_cont - z_cont_imp) / (1.0 - t_view).clamp_min(1e-4)
+        return (x0_hat_cont - z_cont_imp) / (1.0 - t_view).clamp_min(
+            float(velocity_t_eps)
+        )
     raise ValueError(f"Unknown prediction_type: {prediction_type}")
+
+
+def resolve_representation_loss_space(
+    prediction_type: str,
+    requested_space: str,
+) -> str:
+    if requested_space == "auto":
+        return "x0" if prediction_type == "x0" else "velocity"
+    if requested_space not in {"x0", "velocity"}:
+        raise ValueError(f"Unknown representation_loss_space: {requested_space}")
+    return requested_space
+
+
+def representation_loss_pair(
+    *,
+    z_cont_imp: torch.Tensor,
+    t: torch.Tensor,
+    x0_hat_cont: torch.Tensor,
+    x0_target_cont: torch.Tensor,
+    v_pred_cont: torch.Tensor,
+    v_target_cont: torch.Tensor,
+    prediction_type: str,
+    loss_space: str,
+    velocity_t_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, str]:
+    resolved_space = resolve_representation_loss_space(prediction_type, loss_space)
+    if resolved_space == "x0":
+        return x0_hat_cont, x0_target_cont, resolved_space
+    if prediction_type == "velocity":
+        return v_pred_cont, v_target_cont, resolved_space
+    if prediction_type != "x0":
+        raise ValueError(f"Unknown prediction_type: {prediction_type}")
+    if velocity_t_eps <= 0:
+        raise ValueError(f"velocity_loss_t_eps must be positive, got {velocity_t_eps}")
+    t_view = t.view(-1, 1, 1).to(device=z_cont_imp.device, dtype=z_cont_imp.dtype)
+    denom = (1.0 - t_view).clamp_min(float(velocity_t_eps))
+    return (
+        (x0_hat_cont - z_cont_imp) / denom,
+        (x0_target_cont - z_cont_imp) / denom,
+        resolved_space,
+    )
 
 
 def entries_smooth_l1_masked(
@@ -557,6 +626,14 @@ def hash_model_state(model: torch.nn.Module) -> str:
     return digest.hexdigest()
 
 
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def effective_fk_consistency_weight(
     base_weight: float, warmup_steps: int, optimizer_step: int
 ) -> tuple[float, float]:
@@ -567,6 +644,7 @@ def effective_fk_consistency_weight(
 
 
 RESUME_CONTRACT_FIELDS = (
+    "resume_contract_version",
     "data_root",
     "text_root",
     "split",
@@ -623,6 +701,9 @@ RESUME_CONTRACT_FIELDS = (
     "foot_lock_contact_threshold",
     "root_heading_loss_weight",
     "velocity_loss_weight",
+    "representation_loss_space",
+    "velocity_loss_t_eps",
+    "source_manifest_sha256",
 )
 
 OPTIONAL_RESUME_CONTRACT_FIELDS = (
@@ -642,10 +723,16 @@ def validate_resume_contract(
     checkpoint_args: Any,
     path: str,
     allowed_mismatches: tuple[str, ...] = (),
+    allowed_missing_fields: tuple[str, ...] = (),
 ) -> None:
     if not isinstance(checkpoint_args, dict):
         raise RuntimeError(f"Checkpoint is missing its resolved args contract: {path}")
-    missing = [field for field in RESUME_CONTRACT_FIELDS if field not in checkpoint_args]
+    allowed_missing = set(allowed_missing_fields)
+    missing = [
+        field
+        for field in RESUME_CONTRACT_FIELDS
+        if field not in checkpoint_args and field not in allowed_missing
+    ]
     fields_to_compare = RESUME_CONTRACT_FIELDS + tuple(
         field for field in OPTIONAL_RESUME_CONTRACT_FIELDS if field in checkpoint_args
     )
@@ -1034,12 +1121,17 @@ def compute_step_loss(
         valid_cont_unmasked = valid[..., None] & (~mask_cont)
         valid_contact = valid[..., None].expand_as(contact_logits)
         cont_weights = continuous_loss_weights(args, v_pred_cont.device, v_pred_cont.dtype)
-        if args.prediction_type == "x0":
-            primary_pred = x0_hat_cont
-            primary_target = state["x0_cont"]
-        else:
-            primary_pred = v_pred_cont
-            primary_target = state["v_target_cont"]
+        primary_pred, primary_target, resolved_loss_space = representation_loss_pair(
+            z_cont_imp=state["z_cont_imp"],
+            t=timesteps,
+            x0_hat_cont=x0_hat_cont,
+            x0_target_cont=state["x0_cont"],
+            v_pred_cont=v_pred_cont,
+            v_target_cont=state["v_target_cont"],
+            prediction_type=args.prediction_type,
+            loss_space=str(getattr(args, "representation_loss_space", "auto")),
+            velocity_t_eps=float(getattr(args, "velocity_loss_t_eps", 0.05)),
+        )
         flow_loss, repr_raw, repr_weighted = representation_mse_loss(
             primary_pred,
             primary_target,
@@ -1054,28 +1146,16 @@ def compute_step_loss(
             if args.clean_cont_loss_weight > 0
             else flow_loss.detach() * 0.0
         )
-        if args.prediction_type == "x0":
-            root_heading_primary = mse_masked(
-                x0_hat_cont[..., :ROOT_DIM],
-                state["x0_cont"][..., :ROOT_DIM],
-                valid_cont_unmasked[..., :ROOT_DIM],
-            )
-            velocity_channel_primary = mse_masked(
-                x0_hat_cont[..., VELOCITY_SLICE],
-                state["x0_cont"][..., VELOCITY_SLICE],
-                valid_cont_unmasked[..., VELOCITY_SLICE],
-            )
-        else:
-            root_heading_primary = mse_masked(
-                v_pred_cont[..., :ROOT_DIM],
-                state["v_target_cont"][..., :ROOT_DIM],
-                valid_cont_unmasked[..., :ROOT_DIM],
-            )
-            velocity_channel_primary = mse_masked(
-                v_pred_cont[..., VELOCITY_SLICE],
-                state["v_target_cont"][..., VELOCITY_SLICE],
-                valid_cont_unmasked[..., VELOCITY_SLICE],
-            )
+        root_heading_primary = mse_masked(
+            primary_pred[..., :ROOT_DIM],
+            primary_target[..., :ROOT_DIM],
+            valid_cont_unmasked[..., :ROOT_DIM],
+        )
+        velocity_channel_primary = mse_masked(
+            primary_pred[..., VELOCITY_SLICE],
+            primary_target[..., VELOCITY_SLICE],
+            valid_cont_unmasked[..., VELOCITY_SLICE],
+        )
         x0_hat = torch.cat([x0_hat_cont, torch.sigmoid(contact_logits)], dim=-1)
         x0_hat_un = normalizer.denormalize(x0_hat.float())
         semantic_losses = compute_clean_semantic_losses(
@@ -1144,8 +1224,28 @@ def compute_step_loss(
         "fk_consistency_warmup": fk_consistency_warmup,
         "mask_frac": float(motion_mask.float().mean().detach().item()),
         "prediction_type_x0": float(args.prediction_type == "x0"),
+        "loss_space_velocity": float(resolved_loss_space == "velocity"),
+        "timestep_mean": float(timesteps.detach().float().mean().item()),
+        "timestep_min": float(timesteps.detach().float().min().item()),
+        "timestep_max": float(timesteps.detach().float().max().item()),
         "self_cond": float(x_self_cond is not None),
     }
+    if resolved_loss_space == "velocity" and args.prediction_type == "x0":
+        with torch.no_grad():
+            velocity_x0_weight = (
+                1.0
+                / (1.0 - timesteps.detach().float())
+                .clamp_min(float(args.velocity_loss_t_eps))
+                .square()
+            )
+            metrics["velocity_x0_weight_mean"] = float(velocity_x0_weight.mean().item())
+            metrics["velocity_x0_weight_max"] = float(velocity_x0_weight.max().item())
+            metrics["velocity_x0_weight_scaled_mean"] = float(
+                velocity_x0_weight.mean().item() * float(args.representation_loss_scale)
+            )
+            metrics["velocity_x0_weight_scaled_max"] = float(
+                velocity_x0_weight.max().item() * float(args.representation_loss_scale)
+            )
     for name, value in repr_raw.items():
         metrics[f"repr_{name}"] = float(value.detach().float().item())
         metrics[f"repr_{name}_weighted"] = float(
@@ -1185,13 +1285,44 @@ def main() -> None:
         raise ValueError("semantic_weighted representation loss requires --prediction_type x0")
     if float(args.representation_loss_scale) <= 0:
         raise ValueError("--representation_loss_scale must be positive")
+    if float(args.velocity_loss_t_eps) <= 0:
+        raise ValueError("--velocity_loss_t_eps must be positive")
     if float(args.fk_consistency_loss_weight) < 0:
         raise ValueError("--fk_consistency_loss_weight must be non-negative")
     if int(args.fk_consistency_warmup_steps) < 0:
         raise ValueError("--fk_consistency_warmup_steps must be non-negative")
     if args.resume_mode == "loss_fork" and not args.resume:
         raise ValueError("--resume_mode loss_fork requires --resume")
+    if args.resume_mode == "loss_fork" and not str(args.resume_sha256).strip():
+        raise ValueError("--resume_mode loss_fork requires --resume_sha256")
+    if args.resume_sha256 and not args.resume:
+        raise ValueError("--resume_sha256 requires --resume")
     device, rank, world, local_rank = setup_distributed()
+    if args.resume_sha256:
+        resume_hash_result: list[dict[str, str] | None] = [None]
+        if rank == 0:
+            try:
+                resume_hash_result[0] = {
+                    "actual": sha256_file(args.resume),
+                    "error": "",
+                }
+            except OSError as exc:
+                resume_hash_result[0] = {"actual": "", "error": str(exc)}
+        if world > 1:
+            dist.broadcast_object_list(resume_hash_result, src=0)
+        result = resume_hash_result[0]
+        if not isinstance(result, dict) or result.get("error"):
+            raise RuntimeError(
+                f"Could not hash resume checkpoint {args.resume}: "
+                f"{None if result is None else result.get('error')}"
+            )
+        actual_resume_sha = str(result["actual"])
+        expected_resume_sha = str(args.resume_sha256).strip().lower()
+        if actual_resume_sha != expected_resume_sha:
+            raise RuntimeError(
+                "Resume checkpoint SHA256 mismatch: "
+                f"expected={expected_resume_sha}, actual={actual_resume_sha}"
+            )
     seed_all(args.seed, rank)
     out_dir = Path(args.output_dir) / args.name
     if rank == 0:
@@ -1256,22 +1387,33 @@ def main() -> None:
             weights_only=False,
         )
         allowed_mismatches: tuple[str, ...] = ()
+        allowed_missing_fields: tuple[str, ...] = ()
         if args.resume_mode == "loss_fork":
             allowed_mismatches = (
                 "gradient_accumulation_steps",
                 "representation_loss_mode",
                 "representation_loss_scale",
+                "representation_loss_space",
+                "velocity_loss_t_eps",
                 "fk_consistency_loss_weight",
                 "fk_consistency_scale_m",
                 "fk_consistency_warmup_steps",
                 "deterministic_trace",
                 "trace_seed",
+                "source_manifest_sha256",
+            )
+            allowed_missing_fields = (
+                "resume_contract_version",
+                "representation_loss_space",
+                "velocity_loss_t_eps",
+                "source_manifest_sha256",
             )
         validate_resume_contract(
             args,
             ckpt.get("args"),
             args.resume,
             allowed_mismatches=allowed_mismatches,
+            allowed_missing_fields=allowed_missing_fields,
         )
         raw_model = model.module if isinstance(model, DDP) else model
         try:
@@ -1334,6 +1476,7 @@ def main() -> None:
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
             "master_port": os.environ.get("MASTER_PORT", ""),
             "initial_model_sha256": initial_model_sha256,
+            "source_manifest_sha256": str(args.source_manifest_sha256),
             "trace_hash_steps": int(args.trace_hash_steps),
             "streams": [
                 "random_heading",
@@ -1430,6 +1573,9 @@ def main() -> None:
                     for key, value in group_metrics.items()
                 }
                 metrics["grad_norm_pre_clip"] = grad_norm
+                metrics["grad_clip_active"] = float(
+                    float(args.grad_clip) > 0.0 and grad_norm > float(args.grad_clip)
+                )
                 metrics["effective_global_batch"] = float(effective_global_batch)
                 if micro_digests:
                     append_trace_record(out_dir, rank, global_step, micro_digests)

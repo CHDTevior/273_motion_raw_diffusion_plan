@@ -19,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data.kimodo273_datasets import Kimodo273TextDataset, collate_kimodo273_text
-from models.raw_motion.flow_schedule import bce_logits_masked, build_flow_state
+from models.raw_motion.flow_schedule import bce_logits_masked, build_flow_state, sample_timesteps
 from models.raw_motion.hy273_normalizer import (
     HY273Normalizer,
     apply_kimodo_training_transform,
@@ -35,6 +35,7 @@ from train_hy273_raw_flow import (
     load_yaml,
     make_trace_generator,
     merge_config,
+    representation_loss_pair,
     representation_mse_loss,
     seed_all,
 )
@@ -63,7 +64,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_ratio", type=float, default=0.05)
     parser.add_argument("--max_ratio", type=float, default=0.10)
     parser.add_argument("--max_bin_ratio", type=float, default=0.15)
+    parser.add_argument(
+        "--selection_mode",
+        choices=("aggregate_and_max_bin", "max_bin_only"),
+        default="aggregate_and_max_bin",
+        help=(
+            "Use the aggregate target band plus the per-bin ceiling, or treat a "
+            "fixed-timestep run as a ceiling-only audit."
+        ),
+    )
     parser.add_argument("--consistency_scale_m", type=float, default=0.05)
+    parser.add_argument(
+        "--calibration_loss_space",
+        choices=["x0", "velocity"],
+        default="x0",
+    )
+    parser.add_argument("--velocity_loss_t_eps", type=float, default=0.05)
+    parser.add_argument("--sample_training_timesteps", action="store_true")
+    parser.add_argument("--representation_scale_override", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -159,6 +177,10 @@ def main() -> None:
         raise RuntimeError("Calibration requires an available CUDA device")
     if cli.batch_size < 1 or cli.batches_per_bin < 1:
         raise ValueError("batch_size and batches_per_bin must be positive")
+    if cli.velocity_loss_t_eps <= 0:
+        raise ValueError("velocity_loss_t_eps must be positive")
+    if cli.representation_scale_override < 0:
+        raise ValueError("representation_scale_override must be non-negative")
 
     checkpoint = None
     checkpoint_path: Path | None = None
@@ -222,13 +244,23 @@ def main() -> None:
     normalizer = HY273Normalizer.from_data_root(args.data_root).to(device)
     t_bins = _float_list(cli.t_bins)
     lambda_candidates = _float_list(cli.lambda_candidates)
-    if any(not 0.0 < value < 1.0 for value in t_bins):
+    if not cli.sample_training_timesteps and any(not 0.0 < value < 1.0 for value in t_bins):
         raise ValueError(f"All t bins must be in (0,1), got {t_bins}")
 
     rows: list[dict[str, Any]] = []
-    for bin_index, timestep_value in enumerate(t_bins):
-        for batch_index, batch in enumerate(batches):
-            trace_step = checkpoint_step + bin_index * len(batches) + batch_index
+    if cli.sample_training_timesteps:
+        work_items = [
+            (None, batch_index, batch)
+            for batch_index, batch in enumerate(batches)
+        ]
+    else:
+        work_items = [
+            (timestep_value, batch_index, batch)
+            for timestep_value in t_bins
+            for batch_index, batch in enumerate(batches)
+        ]
+    for work_index, (timestep_value, batch_index, batch) in enumerate(work_items):
+            trace_step = checkpoint_step + work_index
             x0_un = batch["motion"].to(device=device, dtype=torch.float32, non_blocking=True)
             valid = batch["valid"].to(device=device, non_blocking=True)
             heading_generator = make_trace_generator(
@@ -236,6 +268,9 @@ def main() -> None:
             )
             noise_generator = make_trace_generator(
                 args, device, rank=0, step=trace_step, micro_step=0, stream=3
+            )
+            timestep_generator = make_trace_generator(
+                args, device, rank=0, step=trace_step, micro_step=0, stream=2
             )
             contact_generator = make_trace_generator(
                 args, device, rank=0, step=trace_step, micro_step=0, stream=4
@@ -252,12 +287,22 @@ def main() -> None:
             x0 = normalizer.normalize(transform.motion)
             observed = torch.zeros_like(x0)
             motion_mask = torch.zeros_like(x0, dtype=torch.bool)
-            timesteps = torch.full(
-                (x0.shape[0],),
-                float(timestep_value),
-                device=device,
-                dtype=x0.dtype,
-            )
+            if timestep_value is None:
+                timesteps = sample_timesteps(
+                    x0.shape[0],
+                    device=device,
+                    schedule=str(args.time_schedule),
+                    p_mean=float(args.denoiser_p_mean),
+                    p_std=float(args.denoiser_p_std),
+                    generator=timestep_generator,
+                ).to(dtype=x0.dtype)
+            else:
+                timesteps = torch.full(
+                    (x0.shape[0],),
+                    float(timestep_value),
+                    device=device,
+                    dtype=x0.dtype,
+                )
             noise_cont = torch.randn(
                 x0[..., :CONT_DIM].shape,
                 device=device,
@@ -305,9 +350,20 @@ def main() -> None:
             l0, _, _ = representation_mse_loss(
                 output_cont, state["x0_cont"].float(), valid_cont, args
             )
+            candidate_pred, candidate_target, _ = representation_loss_pair(
+                z_cont_imp=state["z_cont_imp"].float(),
+                t=timesteps,
+                x0_hat_cont=output_cont,
+                x0_target_cont=state["x0_cont"].float(),
+                v_pred_cont=output_cont,
+                v_target_cont=state["v_target_cont"].float(),
+                prediction_type="x0",
+                loss_space=str(cli.calibration_loss_space),
+                velocity_t_eps=float(cli.velocity_loss_t_eps),
+            )
             args.representation_loss_mode = "semantic_weighted"
             l2_unit, _, _ = representation_mse_loss(
-                output_cont, state["x0_cont"].float(), valid_cont, args
+                candidate_pred, candidate_target, valid_cont, args
             )
             x0_hat = torch.cat(
                 [output_cont, torch.sigmoid(output[..., CONTACT_SLICE])], dim=-1
@@ -352,7 +408,13 @@ def main() -> None:
             rms_consistency = _rms(grad_consistency)
             rows.append(
                 {
-                    "t": float(timestep_value),
+                    "t": (
+                        float(timesteps.mean().item())
+                        if timestep_value is None
+                        else float(timestep_value)
+                    ),
+                    "t_min": float(timesteps.min().item()),
+                    "t_max": float(timesteps.max().item()),
                     "batch_index": int(batch_index),
                     "dataset_indices": [int(value) for value in batch["dataset_indices"].tolist()],
                     "l0": float(l0.detach().item()),
@@ -375,7 +437,12 @@ def main() -> None:
     global_rms_l0 = _aggregate_rms(rows, "grad_rms_l0")
     global_rms_l2_unit = _aggregate_rms(rows, "grad_rms_l2_unit")
     global_rms_consistency = _aggregate_rms(rows, "grad_rms_consistency")
-    alpha = global_rms_l0 / max(global_rms_l2_unit, 1e-30)
+    computed_alpha = global_rms_l0 / max(global_rms_l2_unit, 1e-30)
+    alpha = (
+        float(cli.representation_scale_override)
+        if float(cli.representation_scale_override) > 0
+        else computed_alpha
+    )
     for row in rows:
         full_rms_squared = (
             (float(args.flow_loss_weight) * alpha) ** 2
@@ -395,13 +462,20 @@ def main() -> None:
     global_rms_l2_full = _aggregate_rms(rows, "grad_rms_l2_full_objective")
 
     by_t: dict[str, dict[str, Any]] = {}
-    for timestep_value in t_bins:
-        bin_rows = [row for row in rows if row["t"] == timestep_value]
+    bucket_items: list[tuple[str, list[dict[str, Any]]]]
+    if cli.sample_training_timesteps:
+        bucket_items = [("training_distribution", rows)]
+    else:
+        bucket_items = [
+            (str(timestep_value), [row for row in rows if row["t"] == timestep_value])
+            for timestep_value in t_bins
+        ]
+    for bucket_name, bin_rows in bucket_items:
         bin_rms_l0 = _aggregate_rms(bin_rows, "grad_rms_l0")
         bin_rms_l2 = _aggregate_rms(bin_rows, "grad_rms_l2_unit")
         bin_rms_consistency = _aggregate_rms(bin_rows, "grad_rms_consistency")
         bin_rms_l2_full = _aggregate_rms(bin_rows, "grad_rms_l2_full_objective")
-        by_t[str(timestep_value)] = {
+        by_t[bucket_name] = {
             "count": len(bin_rows),
             "gradient_elements": sum(int(row["gradient_elements"]) for row in bin_rows),
             "aggregate_grad_rms_l0": bin_rms_l0,
@@ -429,9 +503,11 @@ def main() -> None:
             for key, summary in by_t.items()
         }
         aggregate_ratio = value * global_rms_consistency / max(global_rms_l2_full, 1e-30)
-        passed = (
-            float(cli.min_ratio) <= aggregate_ratio <= float(cli.max_ratio)
-            and max(bin_ratios.values()) <= float(cli.max_bin_ratio)
+        max_observed_bin_ratio = max(bin_ratios.values())
+        aggregate_passed = float(cli.min_ratio) <= aggregate_ratio <= float(cli.max_ratio)
+        max_bin_passed = max_observed_bin_ratio <= float(cli.max_bin_ratio)
+        passed = max_bin_passed and (
+            aggregate_passed or cli.selection_mode == "max_bin_only"
         )
         candidates.append(
             {
@@ -439,6 +515,8 @@ def main() -> None:
                 "aggregate_ratio": aggregate_ratio,
                 "per_batch_ratio": _summary(ratios),
                 "bin_aggregate_ratios": bin_ratios,
+                "aggregate_passed": bool(aggregate_passed),
+                "max_bin_passed": bool(max_bin_passed),
                 "passed": bool(passed),
                 "target_distance": abs(aggregate_ratio - float(cli.target_ratio)),
             }
@@ -462,8 +540,23 @@ def main() -> None:
         "trace_seed": int(cli.trace_seed),
         "sample_count": sample_count,
         "t_bins": t_bins,
+        "sample_training_timesteps": bool(cli.sample_training_timesteps),
+        "selection_mode": str(cli.selection_mode),
+        "selection_thresholds": {
+            "target_ratio": float(cli.target_ratio),
+            "min_ratio": float(cli.min_ratio),
+            "max_ratio": float(cli.max_ratio),
+            "max_bin_ratio": float(cli.max_bin_ratio),
+        },
+        "time_schedule": str(args.time_schedule),
+        "denoiser_p_mean": float(args.denoiser_p_mean),
+        "denoiser_p_std": float(args.denoiser_p_std),
         "consistency_scale_m": float(cli.consistency_scale_m),
+        "calibration_loss_space": str(cli.calibration_loss_space),
+        "velocity_loss_t_eps": float(cli.velocity_loss_t_eps),
         "representation_scale_alpha": alpha,
+        "representation_scale_alpha_computed": computed_alpha,
+        "representation_scale_override": float(cli.representation_scale_override),
         "aggregate_grad_rms_l0": global_rms_l0,
         "aggregate_grad_rms_l2_unit": global_rms_l2_unit,
         "aggregate_grad_rms_l2_full_objective": global_rms_l2_full,

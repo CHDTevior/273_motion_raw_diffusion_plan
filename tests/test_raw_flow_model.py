@@ -11,15 +11,20 @@ from models.raw_motion.hy273_slices import load_smplx22_neutral_joints, matrix_t
 from models.raw_motion.hytext_cache import hytext_key
 from models.raw_motion.raw_flow_dit import HY273RawFlow
 from train_hy273_raw_flow import (
+    build_arg_parser,
     compute_clean_semantic_losses,
     effective_fk_consistency_weight,
     fk_position_consistency_loss,
     hash_model_state,
     make_train_state,
+    merge_config,
     predict_clean_cont,
+    prediction_velocity_cont,
+    representation_loss_pair,
     representation_mse_loss,
     resolve_resume_cursor,
     save_checkpoint,
+    sha256_file,
     trace_stream_seed,
 )
 
@@ -189,6 +194,95 @@ def test_semantic_weighted_mse_reduces_each_block_before_weighting():
     assert torch.allclose(sum(weighted.values()), total)
 
 
+def test_x0_prediction_can_use_capped_velocity_loss_space():
+    z = torch.tensor([[[0.5]], [[-0.25]]])
+    x0_target = torch.tensor([[[1.0]], [[0.75]]])
+    x0_pred = torch.tensor([[[0.8]], [[1.25]]])
+    t = torch.tensor([0.5, 0.99])
+    unused = torch.zeros_like(z)
+
+    pred, target, resolved = representation_loss_pair(
+        z_cont_imp=z,
+        t=t,
+        x0_hat_cont=x0_pred,
+        x0_target_cont=x0_target,
+        v_pred_cont=unused,
+        v_target_cont=unused,
+        prediction_type="x0",
+        loss_space="velocity",
+        velocity_t_eps=0.05,
+    )
+
+    denom = torch.tensor([0.5, 0.05]).view(2, 1, 1)
+    assert resolved == "velocity"
+    assert torch.allclose(pred, (x0_pred - z) / denom)
+    assert torch.allclose(target, (x0_target - z) / denom)
+    assert torch.allclose((pred - target).square(), (x0_pred - x0_target).square() / denom.square())
+
+
+@pytest.mark.parametrize("num_steps", [20, 32, 64, 100])
+def test_x0_prediction_ode_velocity_reaches_clean_endpoint(num_steps):
+    z = torch.tensor([[[0.0]]], dtype=torch.float64)
+    x0 = torch.tensor([[[1.0]]], dtype=torch.float64)
+    dt = 1.0 / num_steps
+    for step in range(num_steps):
+        t = torch.tensor([step / num_steps], dtype=torch.float64)
+        velocity = prediction_velocity_cont(
+            z,
+            t,
+            x0,
+            x0,
+            "x0",
+            velocity_t_eps=1e-4,
+        )
+        z = z + dt * velocity
+    assert torch.allclose(z, x0, atol=1e-12, rtol=0.0)
+
+
+def test_auto_representation_loss_space_preserves_legacy_behavior():
+    z = torch.randn(2, 3, 4)
+    x0 = torch.randn_like(z)
+    v = torch.randn_like(z)
+    t = torch.tensor([0.25, 0.75])
+
+    pred, target, resolved = representation_loss_pair(
+        z_cont_imp=z,
+        t=t,
+        x0_hat_cont=x0,
+        x0_target_cont=x0 + 1,
+        v_pred_cont=v,
+        v_target_cont=v + 1,
+        prediction_type="velocity",
+        loss_space="auto",
+        velocity_t_eps=0.05,
+    )
+
+    assert resolved == "velocity"
+    assert pred is v
+    assert torch.allclose(target, v + 1)
+
+
+def test_jit_timestep_config_overrides_parser_defaults():
+    parser = build_arg_parser()
+    args = parser.parse_args([])
+    args = merge_config(
+        args,
+        {
+            "train": {
+                "time_schedule": "logit_normal",
+                "denoiser_p_mean": -0.8,
+                "denoiser_p_std": 0.8,
+                "grad_clip": 0.75,
+            }
+        },
+    )
+
+    assert args.time_schedule == "logit_normal"
+    assert args.denoiser_p_mean == pytest.approx(-0.8)
+    assert args.denoiser_p_std == pytest.approx(0.8)
+    assert args.grad_clip == pytest.approx(0.75)
+
+
 def test_fk_position_consistency_zero_for_neutral_identity_pose_and_has_gradient():
     frames = 3
     x = torch.zeros(1, frames, 273, requires_grad=True)
@@ -288,6 +382,12 @@ def test_checkpoint_persists_authoritative_next_cursor(tmp_path):
     assert checkpoint["epoch"] == 8
     assert checkpoint["step"] == 35
     assert checkpoint["train_state"] == state
+
+
+def test_sha256_file_hashes_checkpoint_parent_bytes(tmp_path):
+    path = tmp_path / "parent.pt"
+    path.write_bytes(b"parent-checkpoint")
+    assert sha256_file(path) == "259299da489be859340845f381c27a9fec3bfb828593801e448cb10ecc8d123b"
 
 
 def test_fk_consistency_warmup_and_model_hash_are_deterministic():

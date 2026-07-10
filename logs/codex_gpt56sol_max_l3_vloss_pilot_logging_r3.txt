@@ -1,0 +1,29 @@
+## Findings
+
+- **P0/P1: None.** The prior pilot-logging P1 is resolved.
+- **P2 — stale-path guards do not detect dangling symlinks.** The launcher uses `[[ -e ... ]]` for the run directory and log ([pilot launcher](/mnt/afs/mogeflow-control/scripts/launch/train_hy273_raw_flow_l3_vloss_pilot_ddp4.sh:100), [log check](/mnt/afs/mogeflow-control/scripts/launch/train_hy273_raw_flow_l3_vloss_pilot_ddp4.sh:105)); `-e` is false for a dangling symlink. The current paths are clean, so this is hardening rather than a blocker.
+- **P2 — environment packages/CUDA remain unattested.** The manifest enumerates code and data artifacts but no Python/PyTorch/CUDA fingerprint ([manifest builder](/mnt/afs/mogeflow-control/tools/build_hy273_l3_vloss_source_manifest.py:12)); the trace records device/port rather than software versions ([training trace contract](/mnt/afs/mogeflow-control/train_hy273_raw_flow.py:1465)).
+- **P2 — payload verification checks manifested files, not newly added extras.** Verification iterates manifest entries only ([verifier](/mnt/afs/mogeflow-control/tools/verify_hy273_l3_vloss_preflight.py:81)). I independently compared all three current payload directories against their manifests: zero missing, extra, or duplicate paths.
+- The prior resume-only P2s remain: unconditional legacy missing-field allowances in `loss_fork` ([training](/mnt/afs/mogeflow-control/train_hy273_raw_flow.py:1391)) and hash/load TOCTOU ([hash](/mnt/afs/mogeflow-control/train_hy273_raw_flow.py:1301), [load](/mnt/afs/mogeflow-control/train_hy273_raw_flow.py:1382)). Neither applies to this scratch experiment.
+
+## Verdict
+
+**GO to launch the fresh 500-step pilot. No P0/P1 remains.**
+
+Production is intentionally **NO-GO right now** because the new fixed pilot artifacts do not yet exist. After the pilot completes, production becomes GO only if its fresh verifier passes.
+
+Verified end to end:
+
+- Pilot identity and log are fixed, with ordinary stale run/log artifacts rejected ([pilot launcher](/mnt/afs/mogeflow-control/scripts/launch/train_hy273_raw_flow_l3_vloss_pilot_ddp4.sh:93)).
+- It emits steps 1–500 through `--log_every 1`, records deterministic trace steps 0–99, binds the current source-manifest SHA, disables periodic saves, and disables the final checkpoint ([pilot command](/mnt/afs/mogeflow-control/scripts/launch/train_hy273_raw_flow_l3_vloss_pilot_ddp4.sh:112)). Training’s save paths are consequently unreachable ([training loop](/mnt/afs/mogeflow-control/train_hy273_raw_flow.py:1604)).
+- These match the verifier’s fixed paths ([verifier defaults](/mnt/afs/mogeflow-control/tools/verify_hy273_l3_vloss_preflight.py:31)), exact 1–500 requirement ([log gate](/mnt/afs/mogeflow-control/tools/verify_hy273_l3_vloss_preflight.py:198)), and config/trace requirements ([contract gate](/mnt/afs/mogeflow-control/tools/verify_hy273_l3_vloss_preflight.py:226)).
+- Production reruns the verifier into a fresh temporary report and does not trust the stale persistent report ([production launcher](/mnt/afs/mogeflow-control/scripts/launch/train_hy273_raw_flow_l3_vloss_scratch_ddp4.sh:94)).
+- Production remains scratch DDP4 on GPU 0–3, batch 16 × 4 ranks × accumulation 2 = global batch 128, `max_steps=200000`, and `save_every=50000` ([production settings](/mnt/afs/mogeflow-control/scripts/launch/train_hy273_raw_flow_l3_vloss_scratch_ddp4.sh:13), [training limits](/mnt/afs/mogeflow-control/scripts/launch/train_hy273_raw_flow_l3_vloss_scratch_ddp4.sh:57), [production command](/mnt/afs/mogeflow-control/scripts/launch/train_hy273_raw_flow_l3_vloss_scratch_ddp4.sh:188)).
+- Existing L3 is on GPU 4–7/port 29832 ([existing trace](/mnt/afs/mogeflow-control/checkpoints/t2m/hy273_l3_scratch200k_ddp4_20260710_103509/trace_contract.json:2)); the new launch uses GPU 0–3/port 29833 and a separate lock. The existing run continued advancing during review.
+
+Validation completed:
+
+- Source manifest: 34/34 entries passed; SHA-256 `0b5bce3116b0eb2e4b89ab78223b853e27473c631c78e036d7c80fed23a8a0e5`.
+- Payloads: all 26,846 motion arrays, 37,932 text files, and 39 HYText shards re-hashed successfully.
+- Focused tests: **21 passed**.
+- The legacy pilot’s log metrics still pass, but its config and trace both fail current source-manifest binding, confirming stale evidence is rejected.

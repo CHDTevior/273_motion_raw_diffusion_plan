@@ -66,6 +66,7 @@ This repository now includes the current HY273 raw-flow implementation snapshot 
 - `scripts/launch/train_hy273_raw_flow_l2_l3_scratch_ddp4.sh`
 - `tools/calibrate_hy273_l2_l3_losses.py`
 - `tools/verify_hy273_l2_l3_preflight.py`
+- `tools/monitor_hy273_training.py`
 - `tests/test_hy273_constraints.py`
 - `tests/test_kimodo273_dataset.py`
 - `tests/test_raw_flow_model.py`

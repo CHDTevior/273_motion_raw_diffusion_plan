@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import gc
+import hashlib
 import json
 import os
 import random
@@ -13,6 +16,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -32,9 +36,13 @@ from models.raw_motion.hy273_slices import (
     CONTACT_JOINTS,
     CONTACT_SLICE,
     CONT_DIM,
+    GLOBAL_ROT_SLICE,
+    HEADING_SLICE,
+    JOINT_POS_SLICE,
     ROOT_DIM,
     ROOT_SLICE,
     VELOCITY_SLICE,
+    fk_positions_from_global_rot6d,
     reconstruct_global_joints_from_features,
 )
 from models.raw_motion.raw_flow_dit import HY273RawFlow
@@ -108,9 +116,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max_steps", type=int, default=0)
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--save_every", type=int, default=50000)
+    p.add_argument(
+        "--save_final",
+        "--save-final",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write latest.pt when training exits; disable only for short smoke runs.",
+    )
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--amp", action="store_true")
     p.add_argument("--amp_dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--ema", action="store_true")
@@ -166,6 +182,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--foot_lock_contact_threshold", type=float, default=0.5)
     p.add_argument("--root_heading_loss_weight", type=float, default=1.0)
     p.add_argument("--velocity_loss_weight", type=float, default=1.0)
+    p.add_argument(
+        "--representation_loss_mode",
+        choices=["per_entry", "semantic_weighted"],
+        default="per_entry",
+    )
+    p.add_argument("--representation_loss_scale", type=float, default=1.0)
+    p.add_argument("--fk_consistency_loss_weight", type=float, default=0.0)
+    p.add_argument("--fk_consistency_scale_m", type=float, default=0.05)
+    p.add_argument("--fk_consistency_warmup_steps", type=int, default=0)
+    p.add_argument("--deterministic_trace", action="store_true")
+    p.add_argument("--trace_seed", type=int, default=3407)
+    p.add_argument("--trace_hash_steps", type=int, default=100)
+    p.add_argument("--resume_mode", choices=["strict", "loss_fork"], default="strict")
+    p.add_argument("--expected_resume_step", type=int, default=-1)
+    p.add_argument("--resume_epoch", type=int, default=-1)
+    p.add_argument("--resume_step_in_epoch", type=int, default=-1)
+    p.add_argument("--require_exact_resume_cursor", action="store_true")
+    p.add_argument("--resume_sha256", default="")
+    p.add_argument("--expected_initial_model_sha256", default="")
     p.add_argument("--self_conditioning", action="store_true")
     p.add_argument("--self_cond_train_prob", type=float, default=0.5)
     p.add_argument("--self_cond_mode", default="add_proj")
@@ -203,6 +238,7 @@ def merge_config(
         "max_steps": "train.max_steps",
         "lr": "train.lr",
         "weight_decay": "train.weight_decay",
+        "gradient_accumulation_steps": "train.gradient_accumulation_steps",
         "prediction_type": "model.prediction_type",
         "hidden_dim": "model.hidden_dim",
         "num_heads": "model.num_heads",
@@ -234,6 +270,14 @@ def merge_config(
         "foot_lock_contact_threshold": "loss.foot_lock_contact_threshold",
         "root_heading_loss_weight": "loss.root_heading",
         "velocity_loss_weight": "loss.velocity",
+        "representation_loss_mode": "loss.representation_mode",
+        "representation_loss_scale": "loss.representation_scale",
+        "fk_consistency_loss_weight": "loss.fk_consistency",
+        "fk_consistency_scale_m": "loss.fk_consistency_scale_m",
+        "fk_consistency_warmup_steps": "loss.fk_consistency_warmup_steps",
+        "deterministic_trace": "train.deterministic_trace",
+        "trace_seed": "train.trace_seed",
+        "trace_hash_steps": "train.trace_hash_steps",
         "control_modes": "control.modes",
         "max_control_keyframes": "control.max_keyframes",
         "endpoint_preset": "control.endpoint_preset",
@@ -326,6 +370,45 @@ def weighted_smooth_l1_masked(
     return (loss * mask_f * weight).sum() / denom
 
 
+SEMANTIC_BLOCKS = {
+    "root": (ROOT_SLICE, 10.0),
+    "heading": (HEADING_SLICE, 2.0),
+    "joint_pos": (JOINT_POS_SLICE, 10.0),
+    "rot6d": (GLOBAL_ROT_SLICE, 10.0),
+    "velocity": (VELOCITY_SLICE, 3.0),
+}
+SEMANTIC_WEIGHT_SUM = sum(weight for _, weight in SEMANTIC_BLOCKS.values())
+
+
+def representation_mse_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    raw_components = {
+        name: mse_masked(pred[..., block_slice], target[..., block_slice], mask[..., block_slice])
+        for name, (block_slice, _weight) in SEMANTIC_BLOCKS.items()
+    }
+    mode = str(getattr(args, "representation_loss_mode", "per_entry"))
+    scale = float(getattr(args, "representation_loss_scale", 1.0))
+    if mode == "per_entry":
+        entry_weights = continuous_loss_weights(args, pred.device, pred.dtype)
+        total = weighted_mse_masked(pred, target, mask, entry_weights)
+        weighted_components = {
+            name: raw.detach() * 0.0 for name, raw in raw_components.items()
+        }
+        return total, raw_components, weighted_components
+    if mode != "semantic_weighted":
+        raise ValueError(f"Unknown representation_loss_mode: {mode}")
+    weighted_components = {
+        name: raw_components[name] * (scale * weight / SEMANTIC_WEIGHT_SUM)
+        for name, (_block_slice, weight) in SEMANTIC_BLOCKS.items()
+    }
+    total = sum(weighted_components.values())
+    return total, raw_components, weighted_components
+
+
 def predict_clean_cont(
     z_cont_imp: torch.Tensor,
     t: torch.Tensor,
@@ -366,6 +449,38 @@ def entries_smooth_l1_masked(
     loss = torch.nn.functional.smooth_l1_loss(pred, target, reduction="none", beta=beta)
     denom = mask_f.expand_as(loss).sum().clamp_min(1.0)
     return (loss * mask_f).sum() / denom
+
+
+def fk_position_consistency_loss(
+    x0_hat_norm: torch.Tensor,
+    observed_norm: torch.Tensor,
+    motion_mask: torch.Tensor,
+    valid: torch.Tensor,
+    normalizer: HY273Normalizer,
+    scale_m: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if scale_m <= 0:
+        raise ValueError(f"fk_consistency_scale_m must be positive, got {scale_m}")
+    mask_f = motion_mask.to(device=x0_hat_norm.device, dtype=x0_hat_norm.dtype)
+    x0_hat_clamped = x0_hat_norm * (1.0 - mask_f) + observed_norm * mask_f
+    with torch.autocast(device_type=x0_hat_norm.device.type, enabled=False):
+        x0_hat_un = normalizer.denormalize(x0_hat_clamped.float())
+        joints_pos = reconstruct_global_joints_from_features(x0_hat_un)
+        joints_fk = fk_positions_from_global_rot6d(x0_hat_un)
+        residual_scaled = (joints_fk - joints_pos) / float(scale_m)
+        element_loss = F.smooth_l1_loss(
+            residual_scaled,
+            torch.zeros_like(residual_scaled),
+            reduction="none",
+            beta=1.0,
+        )
+        valid_f = valid.to(device=element_loss.device, dtype=element_loss.dtype)[..., None, None]
+        denom = valid_f.expand_as(element_loss).sum().clamp_min(1.0)
+        loss = (element_loss * valid_f).sum() / denom
+        distance_cm = (joints_fk - joints_pos).norm(dim=-1) * 100.0
+        distance_denom = valid_f[..., 0].expand_as(distance_cm).sum().clamp_min(1.0)
+        mean_distance_cm = (distance_cm * valid_f[..., 0]).sum() / distance_denom
+    return loss, mean_distance_cm
 
 
 def compute_clean_semantic_losses(
@@ -410,6 +525,7 @@ def save_checkpoint(
     epoch: int,
     step: int,
     ema_state: dict[str, torch.Tensor] | None = None,
+    train_state: dict[str, Any] | None = None,
 ) -> None:
     raw_model = model.module if isinstance(model, DDP) else model
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -421,10 +537,33 @@ def save_checkpoint(
         "epoch": int(epoch),
         "step": int(step),
     }
+    if train_state is not None:
+        payload["train_state"] = dict(train_state)
+        payload["epoch"] = int(train_state["next_epoch"])
     if ema_state is not None:
         payload["ema"] = {key: value.detach().cpu() for key, value in ema_state.items()}
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
+
+
+def hash_model_state(model: torch.nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(model.state_dict().items()):
+        tensor = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def effective_fk_consistency_weight(
+    base_weight: float, warmup_steps: int, optimizer_step: int
+) -> tuple[float, float]:
+    if warmup_steps <= 0:
+        return float(base_weight), 1.0
+    factor = min(max((int(optimizer_step) + 1) / float(warmup_steps), 0.0), 1.0)
+    return float(base_weight) * factor, factor
 
 
 RESUME_CONTRACT_FIELDS = (
@@ -458,16 +597,24 @@ RESUME_CONTRACT_FIELDS = (
     "hytext_cache_dir",
     "hytext_ctxt_dim",
     "hytext_vtxt_dim",
+    "hytext_max_open_shards",
     "hytext_allow_cache_miss",
     "text_dropout_prob",
     "random_first_heading",
     "root_origin_shift",
+    "control_modes",
+    "max_control_keyframes",
+    "endpoint_preset",
+    "endpoint_subset_mode",
+    "endpoint_root_ref_mode",
     "self_conditioning",
     "self_cond_train_prob",
     "self_cond_mode",
     "self_cond_scale",
     "flow_loss_weight",
     "contact_loss_weight",
+    "control_cont_loss_weight",
+    "control_contact_loss_weight",
     "clean_cont_loss_weight",
     "clean_root_vel_loss_weight",
     "clean_joint_vel_loss_weight",
@@ -478,15 +625,37 @@ RESUME_CONTRACT_FIELDS = (
     "velocity_loss_weight",
 )
 
+OPTIONAL_RESUME_CONTRACT_FIELDS = (
+    "gradient_accumulation_steps",
+    "representation_loss_mode",
+    "representation_loss_scale",
+    "fk_consistency_loss_weight",
+    "fk_consistency_scale_m",
+    "fk_consistency_warmup_steps",
+    "deterministic_trace",
+    "trace_seed",
+)
 
-def validate_resume_contract(args: argparse.Namespace, checkpoint_args: Any, path: str) -> None:
+
+def validate_resume_contract(
+    args: argparse.Namespace,
+    checkpoint_args: Any,
+    path: str,
+    allowed_mismatches: tuple[str, ...] = (),
+) -> None:
     if not isinstance(checkpoint_args, dict):
         raise RuntimeError(f"Checkpoint is missing its resolved args contract: {path}")
     missing = [field for field in RESUME_CONTRACT_FIELDS if field not in checkpoint_args]
+    fields_to_compare = RESUME_CONTRACT_FIELDS + tuple(
+        field for field in OPTIONAL_RESUME_CONTRACT_FIELDS if field in checkpoint_args
+    )
+    allowed = set(allowed_mismatches)
     mismatches = [
         (field, checkpoint_args[field], getattr(args, field))
-        for field in RESUME_CONTRACT_FIELDS
-        if field in checkpoint_args and checkpoint_args[field] != getattr(args, field)
+        for field in fields_to_compare
+        if field not in allowed
+        and field in checkpoint_args
+        and checkpoint_args[field] != getattr(args, field)
     ]
     if missing or mismatches:
         details: list[str] = []
@@ -551,6 +720,178 @@ def update_ema_state(ema_state: dict[str, torch.Tensor], model: torch.nn.Module,
             target.copy_(value.to(device=target.device))
 
 
+_MASK63 = (1 << 63) - 1
+
+
+def _splitmix63(value: int) -> int:
+    value = (int(value) + 0x9E3779B97F4A7C15) & ((1 << 64) - 1)
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & ((1 << 64) - 1)
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & ((1 << 64) - 1)
+    return (value ^ (value >> 31)) & _MASK63
+
+
+def trace_stream_seed(base_seed: int, rank: int, step: int, micro_step: int, stream: int) -> int:
+    value = int(base_seed)
+    value ^= int(rank) * 0xD2B74407B1CE6E93
+    value ^= int(step) * 0xCA5A826395121157
+    value ^= int(micro_step) * 0x9E3779B97F4A7C15
+    value ^= int(stream) * 0x94D049BB133111EB
+    return _splitmix63(value)
+
+
+def make_trace_generator(
+    args: argparse.Namespace,
+    device: torch.device,
+    rank: int,
+    step: int,
+    micro_step: int,
+    stream: int,
+) -> torch.Generator | None:
+    if not bool(getattr(args, "deterministic_trace", False)):
+        return None
+    generator = torch.Generator(device=device)
+    generator.manual_seed(
+        trace_stream_seed(
+            int(getattr(args, "trace_seed", args.seed)),
+            rank,
+            step,
+            micro_step,
+            stream,
+        )
+    )
+    return generator
+
+
+def apply_deterministic_text_dropout(
+    texts: list[str],
+    probability: float,
+    device: torch.device,
+    generator: torch.Generator | None,
+) -> tuple[list[str], torch.Tensor | None, float]:
+    if generator is None:
+        return texts, None, float(probability)
+    dropped = torch.rand(len(texts), device=device, generator=generator) < float(probability)
+    output = ["" if bool(dropped[i].item()) else text for i, text in enumerate(texts)]
+    return output, dropped, 0.0
+
+
+def training_trace_digest(
+    batch: dict[str, Any],
+    yaw_delta: torch.Tensor,
+    timesteps: torch.Tensor,
+    model_in: torch.Tensor,
+    text_dropped: torch.Tensor | None,
+) -> str:
+    digest = hashlib.sha256()
+    for key in ("dataset_indices", "crop_starts", "caption_indices", "lengths"):
+        value = batch.get(key)
+        if torch.is_tensor(value):
+            digest.update(key.encode("ascii"))
+            digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+    digest.update("\n".join(str(item) for item in batch.get("motion_ids", [])).encode("utf-8"))
+    for name, value in (("yaw", yaw_delta), ("t", timesteps), ("model_in", model_in)):
+        digest.update(name.encode("ascii"))
+        digest.update(value.detach().float().cpu().contiguous().numpy().tobytes())
+    if text_dropped is not None:
+        digest.update(text_dropped.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def append_trace_record(
+    out_dir: Path,
+    rank: int,
+    optimizer_step: int,
+    micro_digests: list[str],
+) -> None:
+    trace_dir = out_dir / "logs"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    path = trace_dir / f"trace_rank{rank:02d}.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "optimizer_step": int(optimizer_step),
+                    "micro_digests": list(micro_digests),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+
+def make_train_state(
+    *,
+    next_epoch: int,
+    next_step_in_epoch: int,
+    optimizer_steps_per_epoch: int,
+    world_size: int,
+    batch_size_per_rank: int,
+    gradient_accumulation_steps: int,
+) -> dict[str, Any]:
+    return {
+        "format": "hy273_train_cursor_v1",
+        "next_epoch": int(next_epoch),
+        "next_step_in_epoch": int(next_step_in_epoch),
+        "optimizer_steps_per_epoch": int(optimizer_steps_per_epoch),
+        "world_size": int(world_size),
+        "batch_size_per_rank": int(batch_size_per_rank),
+        "gradient_accumulation_steps": int(gradient_accumulation_steps),
+        "effective_global_batch": int(
+            world_size * batch_size_per_rank * gradient_accumulation_steps
+        ),
+    }
+
+
+def resolve_resume_cursor(
+    args: argparse.Namespace,
+    checkpoint: dict[str, Any],
+    optimizer_steps_per_epoch: int,
+    effective_global_batch: int,
+) -> tuple[int, int]:
+    state = checkpoint.get("train_state")
+    if isinstance(state, dict):
+        if state.get("format") != "hy273_train_cursor_v1":
+            raise RuntimeError(f"Unsupported checkpoint train_state: {state.get('format')!r}")
+        saved_steps = int(state.get("optimizer_steps_per_epoch", -1))
+        saved_batch = int(state.get("effective_global_batch", -1))
+        if saved_steps != int(optimizer_steps_per_epoch):
+            raise RuntimeError(
+                "Resume cursor is incompatible with this loader: "
+                f"checkpoint optimizer_steps_per_epoch={saved_steps}, "
+                f"requested={optimizer_steps_per_epoch}"
+            )
+        if saved_batch != int(effective_global_batch):
+            raise RuntimeError(
+                "Resume cursor is incompatible with this global batch: "
+                f"checkpoint={saved_batch}, requested={effective_global_batch}"
+            )
+        return int(state["next_epoch"]), int(state["next_step_in_epoch"])
+
+    explicit_epoch = int(getattr(args, "resume_epoch", -1))
+    explicit_step = int(getattr(args, "resume_step_in_epoch", -1))
+    if (explicit_epoch >= 0) != (explicit_step >= 0):
+        raise RuntimeError("--resume_epoch and --resume_step_in_epoch must be provided together")
+    if explicit_epoch >= 0:
+        return explicit_epoch, explicit_step
+    if bool(getattr(args, "require_exact_resume_cursor", False)):
+        raise RuntimeError(
+            "Checkpoint has no exact train_state cursor; provide explicit legacy resume cursor"
+        )
+    return int(checkpoint.get("epoch", 0)), 0
+
+
+def average_metrics_across_ranks(
+    metrics: dict[str, float], device: torch.device
+) -> dict[str, float]:
+    if not is_dist():
+        return metrics
+    keys = sorted(metrics)
+    values = torch.tensor([metrics[key] for key in keys], device=device, dtype=torch.float64)
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    values.div_(float(dist.get_world_size()))
+    return {key: float(value) for key, value in zip(keys, values.tolist())}
+
+
 def compute_step_loss(
     model: torch.nn.Module,
     batch: dict[str, Any],
@@ -559,14 +900,25 @@ def compute_step_loss(
     device: torch.device,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
-) -> tuple[torch.Tensor, dict[str, float]]:
+    rank: int = 0,
+    optimizer_step: int = 0,
+    micro_step: int = 0,
+) -> tuple[torch.Tensor, dict[str, float], str | None]:
     x0_un = batch["motion"].to(device=device, dtype=torch.float32)
     lengths = batch["lengths"].to(device=device)
     valid = batch["valid"].to(device=device)
+    heading_generator = make_trace_generator(args, device, rank, optimizer_step, micro_step, stream=0)
+    control_generator = make_trace_generator(args, device, rank, optimizer_step, micro_step, stream=1)
+    timestep_generator = make_trace_generator(args, device, rank, optimizer_step, micro_step, stream=2)
+    noise_generator = make_trace_generator(args, device, rank, optimizer_step, micro_step, stream=3)
+    contact_generator = make_trace_generator(args, device, rank, optimizer_step, micro_step, stream=4)
+    self_cond_generator = make_trace_generator(args, device, rank, optimizer_step, micro_step, stream=5)
+    text_drop_generator = make_trace_generator(args, device, rank, optimizer_step, micro_step, stream=6)
     transform = apply_kimodo_training_transform(
         x0_un,
         random_heading=args.random_first_heading,
         root_shift=args.root_origin_shift,
+        generator=heading_generator,
     )
     x0_un = transform.motion
     c_dir = transform.c_dir
@@ -578,6 +930,7 @@ def compute_step_loss(
         endpoint_subset_mode=args.endpoint_subset_mode,
         max_keyframes=args.max_control_keyframes,
         include_root_ref_for_endpoints=args.endpoint_root_ref_mode == "kimodo_hidden_root",
+        generator=control_generator,
     )
     obs_un = controls.observed_motion
     motion_mask = controls.motion_mask.to(device=device)
@@ -589,13 +942,40 @@ def compute_step_loss(
         schedule=args.time_schedule,
         p_mean=args.denoiser_p_mean,
         p_std=args.denoiser_p_std,
+        generator=timestep_generator,
     ).to(dtype=x0.dtype)
-    state = build_flow_state(x0, obs, motion_mask, timesteps)
+    noise_cont = None
+    contact_aux = None
+    if bool(getattr(args, "deterministic_trace", False)):
+        noise_cont = torch.randn(
+            x0[..., :CONT_DIM].shape,
+            device=device,
+            dtype=x0.dtype,
+            generator=noise_generator,
+        )
+        contact_aux = torch.rand(
+            x0[..., CONTACT_SLICE].shape,
+            device=device,
+            dtype=x0.dtype,
+            generator=contact_generator,
+        )
+    state = build_flow_state(
+        x0,
+        obs,
+        motion_mask,
+        timesteps,
+        noise_cont=noise_cont,
+        contact_aux=contact_aux,
+    )
     model_in = state["model_in"]
     x_self_cond = None
 
     use_sc = bool(args.self_conditioning) and float(args.self_cond_train_prob) > 0.0
-    if use_sc and torch.rand((), device=device) < float(args.self_cond_train_prob):
+    use_sc_this_step = False
+    if use_sc:
+        sc_draw = torch.rand((), device=device, generator=self_cond_generator)
+        use_sc_this_step = bool(sc_draw < float(args.self_cond_train_prob))
+    if use_sc_this_step:
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
                 pred0 = model(
@@ -617,15 +997,22 @@ def compute_step_loss(
             mask_f = motion_mask.to(dtype=x0.dtype)
             x_self_cond = (x0_hat0 * (1.0 - mask_f) + obs * mask_f).detach()
 
+    model_texts, text_dropped, model_text_drop_prob = apply_deterministic_text_dropout(
+        list(batch["texts"]),
+        float(args.text_dropout_prob),
+        device,
+        text_drop_generator,
+    )
+
     with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
         pred = model(
             model_in,
             t=timesteps,
             c_dir=c_dir,
-            text=batch["texts"],
+            text=model_texts,
             length_mask=valid,
             x_self_cond=x_self_cond,
-            text_drop_prob=args.text_dropout_prob,
+            text_drop_prob=model_text_drop_prob,
         )
         pred_cont = pred[..., :CONT_DIM]
         contact_logits = pred[..., CONTACT_SLICE]
@@ -648,9 +1035,17 @@ def compute_step_loss(
         valid_contact = valid[..., None].expand_as(contact_logits)
         cont_weights = continuous_loss_weights(args, v_pred_cont.device, v_pred_cont.dtype)
         if args.prediction_type == "x0":
-            flow_loss = weighted_mse_masked(x0_hat_cont, state["x0_cont"], valid_cont_unmasked, cont_weights)
+            primary_pred = x0_hat_cont
+            primary_target = state["x0_cont"]
         else:
-            flow_loss = weighted_mse_masked(v_pred_cont, state["v_target_cont"], valid_cont_unmasked, cont_weights)
+            primary_pred = v_pred_cont
+            primary_target = state["v_target_cont"]
+        flow_loss, repr_raw, repr_weighted = representation_mse_loss(
+            primary_pred,
+            primary_target,
+            valid_cont_unmasked,
+            args,
+        )
         contact_loss = bce_logits_masked(contact_logits, state["x0_contact"], valid_contact)
         control_cont = smooth_l1_masked(x0_hat_cont, obs[..., :CONT_DIM], valid[..., None] & mask_cont)
         control_contact = bce_logits_masked(contact_logits, obs[..., CONTACT_SLICE], valid[..., None] & mask_contact)
@@ -690,6 +1085,33 @@ def compute_step_loss(
             fps=float(args.semantic_loss_fps),
             contact_threshold=float(args.foot_lock_contact_threshold),
         )
+        fk_consistency_base_weight = float(
+            getattr(args, "fk_consistency_loss_weight", 0.0)
+        )
+        fk_consistency_weight, fk_consistency_warmup = effective_fk_consistency_weight(
+            fk_consistency_base_weight,
+            int(getattr(args, "fk_consistency_warmup_steps", 0)),
+            optimizer_step,
+        )
+        if fk_consistency_weight > 0.0:
+            fk_consistency, fk_consistency_cm = fk_position_consistency_loss(
+                x0_hat,
+                obs,
+                motion_mask,
+                valid,
+                normalizer,
+                scale_m=float(getattr(args, "fk_consistency_scale_m", 0.05)),
+            )
+        else:
+            with torch.no_grad():
+                fk_consistency, fk_consistency_cm = fk_position_consistency_loss(
+                    x0_hat,
+                    obs,
+                    motion_mask,
+                    valid,
+                    normalizer,
+                    scale_m=float(getattr(args, "fk_consistency_scale_m", 0.05)),
+                )
         loss = (
             args.flow_loss_weight * flow_loss
             + args.contact_loss_weight * contact_loss
@@ -699,6 +1121,7 @@ def compute_step_loss(
             + args.clean_root_vel_loss_weight * semantic_losses["clean_root_vel"]
             + args.clean_joint_vel_loss_weight * semantic_losses["clean_joint_vel"]
             + args.foot_lock_loss_weight * semantic_losses["foot_lock"]
+            + fk_consistency_weight * fk_consistency
         )
     metrics = {
         "loss": float(loss.detach().float().item()),
@@ -712,11 +1135,39 @@ def compute_step_loss(
         "foot_lock": float(semantic_losses["foot_lock"].detach().float().item()),
         "root_heading_primary": float(root_heading_primary.detach().float().item()),
         "velocity_channel_primary": float(velocity_channel_primary.detach().float().item()),
+        "fk_consistency": float(fk_consistency.detach().float().item()),
+        "fk_consistency_cm": float(fk_consistency_cm.detach().float().item()),
+        "fk_consistency_weighted": float(
+            (fk_consistency_weight * fk_consistency).detach().float().item()
+        ),
+        "fk_consistency_weight": fk_consistency_weight,
+        "fk_consistency_warmup": fk_consistency_warmup,
         "mask_frac": float(motion_mask.float().mean().detach().item()),
         "prediction_type_x0": float(args.prediction_type == "x0"),
         "self_cond": float(x_self_cond is not None),
     }
-    return loss, metrics
+    for name, value in repr_raw.items():
+        metrics[f"repr_{name}"] = float(value.detach().float().item())
+        metrics[f"repr_{name}_weighted"] = float(
+            repr_weighted[name].detach().float().item()
+        )
+    trace_digest = None
+    trace_start = int(getattr(args, "expected_resume_step", -1))
+    if trace_start < 0:
+        trace_start = 0
+    trace_offset = int(optimizer_step) - trace_start
+    if (
+        bool(getattr(args, "deterministic_trace", False))
+        and 0 <= trace_offset < int(getattr(args, "trace_hash_steps", 0))
+    ):
+        trace_digest = training_trace_digest(
+            batch,
+            transform.yaw_delta,
+            timesteps,
+            model_in,
+            text_dropped,
+        )
+    return loss, metrics, trace_digest
 
 
 def main() -> None:
@@ -728,6 +1179,18 @@ def main() -> None:
     args = merge_config(args, cfg, explicit_cli=explicit_cli)
     if not args.data_root:
         raise ValueError("--data_root is required")
+    if int(args.gradient_accumulation_steps) < 1:
+        raise ValueError("--gradient_accumulation_steps must be >= 1")
+    if args.representation_loss_mode == "semantic_weighted" and args.prediction_type != "x0":
+        raise ValueError("semantic_weighted representation loss requires --prediction_type x0")
+    if float(args.representation_loss_scale) <= 0:
+        raise ValueError("--representation_loss_scale must be positive")
+    if float(args.fk_consistency_loss_weight) < 0:
+        raise ValueError("--fk_consistency_loss_weight must be non-negative")
+    if int(args.fk_consistency_warmup_steps) < 0:
+        raise ValueError("--fk_consistency_warmup_steps must be non-negative")
+    if args.resume_mode == "loss_fork" and not args.resume:
+        raise ValueError("--resume_mode loss_fork requires --resume")
     device, rank, world, local_rank = setup_distributed()
     seed_all(args.seed, rank)
     out_dir = Path(args.output_dir) / args.name
@@ -742,6 +1205,7 @@ def main() -> None:
         max_frames=args.max_frames,
         min_frames=args.min_frames,
         random_crop=True,
+        trace_seed=int(args.trace_seed) if args.deterministic_trace else None,
     )
     sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True) if world > 1 else None
     loader = DataLoader(
@@ -754,7 +1218,25 @@ def main() -> None:
         drop_last=True,
         collate_fn=collate_kimodo273_text,
     )
-    model = create_model(args).to(device)
+    accumulation_steps = int(args.gradient_accumulation_steps)
+    usable_micro_batches = (len(loader) // accumulation_steps) * accumulation_steps
+    if usable_micro_batches <= 0:
+        raise RuntimeError(
+            f"DataLoader has {len(loader)} batches, fewer than accumulation={accumulation_steps}"
+        )
+    optimizer_steps_per_epoch = usable_micro_batches // accumulation_steps
+    effective_global_batch = int(world * args.batch_size * accumulation_steps)
+    model = create_model(args)
+    initial_model_sha256 = ""
+    if rank == 0 and not args.resume:
+        initial_model_sha256 = hash_model_state(model)
+        expected_initial_sha256 = str(args.expected_initial_model_sha256).strip()
+        if expected_initial_sha256 and initial_model_sha256 != expected_initial_sha256:
+            raise RuntimeError(
+                "Initial model SHA256 mismatch: "
+                f"expected={expected_initial_sha256}, actual={initial_model_sha256}"
+            )
+    model = model.to(device)
     if world > 1:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     optimizer = torch.optim.AdamW(
@@ -763,11 +1245,34 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
     start_epoch = 0
+    start_step_in_epoch = 0
     global_step = 0
     ema_state: dict[str, torch.Tensor] | None = None
     if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu")
-        validate_resume_contract(args, ckpt.get("args"), args.resume)
+        ckpt = torch.load(
+            args.resume,
+            map_location="cpu",
+            mmap=True,
+            weights_only=False,
+        )
+        allowed_mismatches: tuple[str, ...] = ()
+        if args.resume_mode == "loss_fork":
+            allowed_mismatches = (
+                "gradient_accumulation_steps",
+                "representation_loss_mode",
+                "representation_loss_scale",
+                "fk_consistency_loss_weight",
+                "fk_consistency_scale_m",
+                "fk_consistency_warmup_steps",
+                "deterministic_trace",
+                "trace_seed",
+            )
+        validate_resume_contract(
+            args,
+            ckpt.get("args"),
+            args.resume,
+            allowed_mismatches=allowed_mismatches,
+        )
         raw_model = model.module if isinstance(model, DDP) else model
         try:
             raw_model.load_state_dict(ckpt["model"], strict=True)
@@ -781,8 +1286,11 @@ def main() -> None:
             raise RuntimeError(
                 f"Checkpoint optimizer is incompatible with the requested parameter groups: {args.resume}"
             ) from exc
-        start_epoch = int(ckpt.get("epoch", 0))
         global_step = int(ckpt.get("step", 0))
+        if int(args.expected_resume_step) >= 0 and global_step != int(args.expected_resume_step):
+            raise RuntimeError(
+                f"Expected resume step {args.expected_resume_step}, got {global_step}: {args.resume}"
+            )
         if bool(args.ema):
             checkpoint_ema = validate_ema_contract(
                 raw_model.state_dict(), ckpt.get("ema"), args.resume
@@ -791,45 +1299,166 @@ def main() -> None:
                 key: value.to(device=device) if torch.is_tensor(value) else value
                 for key, value in checkpoint_ema.items()
             }
+        start_epoch, start_step_in_epoch = resolve_resume_cursor(
+            args,
+            ckpt,
+            optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+            effective_global_batch=effective_global_batch,
+        )
+        del ckpt
+        if bool(args.ema):
+            del checkpoint_ema
+        gc.collect()
+    if not 0 <= start_step_in_epoch < optimizer_steps_per_epoch:
+        raise RuntimeError(
+            f"Invalid resume step_in_epoch={start_step_in_epoch}; "
+            f"expected [0,{optimizer_steps_per_epoch})"
+        )
     if bool(args.ema) and ema_state is None:
         ema_state = init_ema_state(model)
     normalizer = HY273Normalizer.from_data_root(args.data_root).to(device)
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and args.amp_dtype == "fp16")
+    if rank == 0 and args.deterministic_trace:
+        trace_contract = {
+            "format": "hy273_stateless_trace_v1",
+            "trace_seed": int(args.trace_seed),
+            "world_size": int(world),
+            "microbatch_per_rank": int(args.batch_size),
+            "gradient_accumulation_steps": accumulation_steps,
+            "effective_global_batch": effective_global_batch,
+            "expected_resume_step": int(args.expected_resume_step),
+            "resume_epoch": int(start_epoch),
+            "resume_step_in_epoch": int(start_step_in_epoch),
+            "resume_sha256": str(args.resume_sha256),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            "master_port": os.environ.get("MASTER_PORT", ""),
+            "initial_model_sha256": initial_model_sha256,
+            "trace_hash_steps": int(args.trace_hash_steps),
+            "streams": [
+                "random_heading",
+                "control",
+                "timestep",
+                "continuous_noise",
+                "contact_aux",
+                "self_conditioning",
+                "text_dropout",
+            ],
+        }
+        (out_dir / "trace_contract.json").write_text(
+            json.dumps(trace_contract, indent=2, sort_keys=True)
+        )
 
+    current_train_state = make_train_state(
+        next_epoch=start_epoch,
+        next_step_in_epoch=start_step_in_epoch,
+        optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+        world_size=world,
+        batch_size_per_rank=args.batch_size,
+        gradient_accumulation_steps=accumulation_steps,
+    )
     try:
         for epoch in range(start_epoch, int(args.max_epochs)):
             if sampler is not None:
                 sampler.set_epoch(epoch)
-            for batch in loader:
-                optimizer.zero_grad(set_to_none=True)
-                loss, metrics = compute_step_loss(
-                    model,
-                    batch,
-                    normalizer,
-                    args,
-                    device,
-                    amp_enabled=bool(args.amp and device.type == "cuda"),
-                    amp_dtype=amp_dtype,
+            if args.deterministic_trace:
+                dataset.set_trace_epoch(epoch)
+            optimizer.zero_grad(set_to_none=True)
+            group_metrics: dict[str, float] = {}
+            micro_digests: list[str] = []
+            first_batch_index = (
+                start_step_in_epoch * accumulation_steps if epoch == start_epoch else 0
+            )
+            for batch_index, batch in enumerate(loader):
+                if batch_index >= usable_micro_batches:
+                    break
+                if batch_index < first_batch_index:
+                    continue
+                micro_step = batch_index % accumulation_steps
+                sync_gradients = micro_step == accumulation_steps - 1
+                sync_context = (
+                    model.no_sync()
+                    if isinstance(model, DDP) and not sync_gradients
+                    else contextlib.nullcontext()
                 )
-                if not torch.isfinite(loss.detach()).all():
-                    raise RuntimeError(f"Non-finite loss at step={global_step}: {metrics}")
+                with sync_context:
+                    loss, micro_metrics, trace_digest = compute_step_loss(
+                        model,
+                        batch,
+                        normalizer,
+                        args,
+                        device,
+                        amp_enabled=bool(args.amp and device.type == "cuda"),
+                        amp_dtype=amp_dtype,
+                        rank=rank,
+                        optimizer_step=global_step,
+                        micro_step=micro_step,
+                    )
+                    if not torch.isfinite(loss.detach()).all():
+                        raise RuntimeError(
+                            f"Non-finite loss at step={global_step} micro={micro_step}: {micro_metrics}"
+                        )
+                    backward_loss = loss / float(accumulation_steps)
+                    if scaler.is_enabled():
+                        scaler.scale(backward_loss).backward()
+                    else:
+                        backward_loss.backward()
+                for key, value in micro_metrics.items():
+                    group_metrics[key] = group_metrics.get(key, 0.0) + float(value)
+                if trace_digest is not None:
+                    micro_digests.append(trace_digest)
+                if not sync_gradients:
+                    continue
+
+                grad_norm = 0.0
                 if scaler.is_enabled():
-                    scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     if args.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                        grad_norm = float(
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
+                        )
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    loss.backward()
                     if args.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                        grad_norm = float(
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
+                        )
                     optimizer.step()
-                if ema_state is not None and int(args.ema_every) > 0 and global_step % int(args.ema_every) == 0:
+                metrics = {
+                    key: value / float(accumulation_steps)
+                    for key, value in group_metrics.items()
+                }
+                metrics["grad_norm_pre_clip"] = grad_norm
+                metrics["effective_global_batch"] = float(effective_global_batch)
+                if micro_digests:
+                    append_trace_record(out_dir, rank, global_step, micro_digests)
+                if (
+                    ema_state is not None
+                    and int(args.ema_every) > 0
+                    and global_step % int(args.ema_every) == 0
+                ):
                     update_ema_state(ema_state, model, float(args.ema_decay))
                 global_step += 1
-                if rank == 0 and (global_step == 1 or global_step % args.log_every == 0):
+                completed_step_in_epoch = batch_index // accumulation_steps + 1
+                if completed_step_in_epoch >= optimizer_steps_per_epoch:
+                    next_epoch = epoch + 1
+                    next_step_in_epoch = 0
+                else:
+                    next_epoch = epoch
+                    next_step_in_epoch = completed_step_in_epoch
+                current_train_state = make_train_state(
+                    next_epoch=next_epoch,
+                    next_step_in_epoch=next_step_in_epoch,
+                    optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+                    world_size=world,
+                    batch_size_per_rank=args.batch_size,
+                    gradient_accumulation_steps=accumulation_steps,
+                )
+                should_log = global_step == 1 or global_step % args.log_every == 0
+                if should_log:
+                    metrics = average_metrics_across_ranks(metrics, device)
+                if rank == 0 and should_log:
                     msg = " ".join(f"{k}={v:.6f}" for k, v in metrics.items())
                     print(f"[train] epoch={epoch} step={global_step} {msg}", flush=True)
                 if rank == 0 and args.save_every > 0 and global_step % args.save_every == 0:
@@ -841,6 +1470,7 @@ def main() -> None:
                         epoch,
                         global_step,
                         ema_state=ema_state,
+                        train_state=current_train_state,
                     )
                     save_checkpoint(
                         out_dir / "model" / "latest.pt",
@@ -850,13 +1480,27 @@ def main() -> None:
                         epoch,
                         global_step,
                         ema_state=ema_state,
+                        train_state=current_train_state,
                     )
+                optimizer.zero_grad(set_to_none=True)
+                group_metrics = {}
+                micro_digests = []
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     break
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break
-        if rank == 0:
-            save_checkpoint(out_dir / "model" / "latest.pt", model, optimizer, args, epoch + 1, global_step, ema_state=ema_state)
+            start_step_in_epoch = 0
+        if rank == 0 and bool(args.save_final):
+            save_checkpoint(
+                out_dir / "model" / "latest.pt",
+                model,
+                optimizer,
+                args,
+                int(current_train_state["next_epoch"]),
+                global_step,
+                ema_state=ema_state,
+                train_state=current_train_state,
+            )
     finally:
         cleanup_distributed()
 

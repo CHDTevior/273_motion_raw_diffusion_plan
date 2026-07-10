@@ -15,6 +15,24 @@ from torch.utils.data import Dataset
 from models.raw_motion.hy273_slices import DIM_HY273, FALLBACK_SHORT_CLIPS
 
 
+_MASK64 = (1 << 64) - 1
+
+
+def _splitmix64(value: int) -> int:
+    value = (int(value) + 0x9E3779B97F4A7C15) & _MASK64
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return value ^ (value >> 31)
+
+
+def deterministic_item_value(seed: int, epoch: int, index: int, stream: int) -> int:
+    value = int(seed) & _MASK64
+    value ^= (int(epoch) * 0xD2B74407B1CE6E93) & _MASK64
+    value ^= (int(index) * 0xCA5A826395121157) & _MASK64
+    value ^= (int(stream) * 0x9E3779B97F4A7C15) & _MASK64
+    return _splitmix64(value)
+
+
 def parse_hml_text_line(line: str) -> str:
     line = line.strip()
     if not line:
@@ -57,6 +75,7 @@ class Kimodo273TextDataset(Dataset):
         exclude_fallback_short_clips: bool = True,
         deterministic_text: bool = False,
         cache_manifest: bool = True,
+        trace_seed: int | None = None,
     ) -> None:
         self.data_root = Path(data_root).expanduser().resolve()
         self.split = str(split)
@@ -65,6 +84,8 @@ class Kimodo273TextDataset(Dataset):
         self.min_frames = int(min_frames)
         self.random_crop = bool(random_crop)
         self.deterministic_text = bool(deterministic_text)
+        self.trace_seed = None if trace_seed is None else int(trace_seed)
+        self.trace_epoch = 0
         split_path = self.data_root / "split_existing" / f"{self.split}.txt"
         if not split_path.is_file():
             raise FileNotFoundError(f"Split file not found: {split_path}")
@@ -100,31 +121,51 @@ class Kimodo273TextDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def _crop(self, motion: np.ndarray) -> np.ndarray:
+    def set_trace_epoch(self, epoch: int) -> None:
+        self.trace_epoch = int(epoch)
+
+    def _crop(self, motion: np.ndarray, deterministic_value: int | None = None) -> tuple[np.ndarray, int]:
         if self.max_frames <= 0 or motion.shape[0] <= self.max_frames:
-            return motion
+            return motion, 0
         span = motion.shape[0] - self.max_frames
         if self.random_crop:
-            start = random.randint(0, span)
+            start = (
+                random.randint(0, span)
+                if deterministic_value is None
+                else int(deterministic_value % (span + 1))
+            )
         else:
             start = span // 2
-        return motion[start : start + self.max_frames]
+        return motion[start : start + self.max_frames], int(start)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         rec = self.records[index]
         motion = np.load(rec["path"]).astype(np.float32, copy=False)
         if motion.ndim != 2 or motion.shape[1] != DIM_HY273:
             raise ValueError(f"Expected [T,{DIM_HY273}] at {rec['path']}, got {motion.shape}")
-        motion = self._crop(motion)
+        crop_value = None
+        if self.trace_seed is not None:
+            crop_value = deterministic_item_value(self.trace_seed, self.trace_epoch, index, stream=0)
+        motion, crop_start = self._crop(motion, deterministic_value=crop_value)
         motion_id = rec["id"]
         captions = _read_captions(self.text_root / f"{motion_id}.txt")
-        text = captions[0] if self.deterministic_text else random.choice(captions)
+        if self.deterministic_text:
+            caption_index = 0
+        elif self.trace_seed is not None:
+            caption_value = deterministic_item_value(self.trace_seed, self.trace_epoch, index, stream=1)
+            caption_index = int(caption_value % len(captions))
+        else:
+            caption_index = random.randrange(len(captions))
+        text = captions[caption_index]
         return {
             "motion": torch.from_numpy(motion.copy()),
             "length": int(motion.shape[0]),
             "text": text,
             "rel_path": rec["rel"],
             "motion_id": motion_id,
+            "dataset_index": int(index),
+            "crop_start": int(crop_start),
+            "caption_index": int(caption_index),
         }
 
 
@@ -138,6 +179,9 @@ def collate_kimodo273_text(batch: list[dict[str, Any]]) -> dict[str, Any]:
     texts: list[str] = []
     rel_paths: list[str] = []
     motion_ids: list[str] = []
+    dataset_indices = torch.zeros(len(batch), dtype=torch.long)
+    crop_starts = torch.zeros(len(batch), dtype=torch.long)
+    caption_indices = torch.zeros(len(batch), dtype=torch.long)
     for i, item in enumerate(batch):
         cur = item["motion"].float()
         length = int(cur.shape[0])
@@ -147,6 +191,9 @@ def collate_kimodo273_text(batch: list[dict[str, Any]]) -> dict[str, Any]:
         texts.append(str(item["text"]))
         rel_paths.append(str(item["rel_path"]))
         motion_ids.append(str(item["motion_id"]))
+        dataset_indices[i] = int(item.get("dataset_index", -1))
+        crop_starts[i] = int(item.get("crop_start", 0))
+        caption_indices[i] = int(item.get("caption_index", 0))
     return {
         "motion": motion,
         "lengths": lengths,
@@ -154,4 +201,7 @@ def collate_kimodo273_text(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "texts": texts,
         "rel_paths": rel_paths,
         "motion_ids": motion_ids,
+        "dataset_indices": dataset_indices,
+        "crop_starts": crop_starts,
+        "caption_indices": caption_indices,
     }

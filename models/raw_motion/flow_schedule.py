@@ -25,11 +25,13 @@ def sample_timesteps(
     p_mean: float = 0.0,
     p_std: float = 1.0,
     eps: float = 1e-4,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     if schedule == "uniform":
-        return torch.rand(batch_size, device=device).clamp(eps, 1.0 - eps)
+        return torch.rand(batch_size, device=device, generator=generator).clamp(eps, 1.0 - eps)
     if schedule == "logit_normal":
-        return torch.sigmoid(torch.randn(batch_size, device=device) * float(p_std) + float(p_mean)).clamp(eps, 1.0 - eps)
+        normal = torch.randn(batch_size, device=device, generator=generator)
+        return torch.sigmoid(normal * float(p_std) + float(p_mean)).clamp(eps, 1.0 - eps)
     raise ValueError(f"Unknown timestep schedule: {schedule}")
 
 

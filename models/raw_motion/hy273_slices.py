@@ -79,6 +79,8 @@ FALLBACK_SHORT_CLIPS = {
     "motion_data/M005836.npy",
 }
 
+_NEUTRAL_JOINTS_CPU_CACHE: dict[str, torch.Tensor] = {}
+
 
 def check_hy273(x: torch.Tensor, name: str = "motion") -> None:
     if x.shape[-1] != DIM_HY273:
@@ -189,8 +191,11 @@ def load_smplx22_neutral_joints(
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    joints = torch.load(Path(path), map_location="cpu").squeeze().to(dtype=dtype)
-    joints = joints - joints[0:1]
+    resolved = str(Path(path).expanduser().resolve())
+    if resolved not in _NEUTRAL_JOINTS_CPU_CACHE:
+        joints_cpu = torch.load(resolved, map_location="cpu").squeeze().float()
+        _NEUTRAL_JOINTS_CPU_CACHE[resolved] = (joints_cpu - joints_cpu[0:1]).contiguous()
+    joints = _NEUTRAL_JOINTS_CPU_CACHE[resolved].to(dtype=dtype)
     if device is not None:
         joints = joints.to(device)
     return joints

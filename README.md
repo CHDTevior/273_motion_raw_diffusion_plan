@@ -8,6 +8,8 @@ Current scope: the first implementation/training pass should use the HumanML3D K
 
 - `docs/HY273_raw_space_diffusion_confirm_plan.md`
 - `docs/HY273_hytext_cache_integration_review.md`
+- `refine-logs/EXPERIMENT_PLAN.md` (current L2/L3 scratch experiment protocol)
+- `refine-logs/EXPERIMENT_TRACKER.md` (live experiment status)
 
 This is the current implementation plan after checking:
 
@@ -60,9 +62,31 @@ This repository now includes the current HY273 raw-flow implementation snapshot 
 - `tools/check_hy273_hytext_cache_coverage.py`
 - `scripts/launch/train_hy273_raw_flow_stage1_x0_hytext_ddp8.sh`
 - `scripts/launch/train_hy273_raw_flow_stage2_x0_control_ddp8.sh`
+- `configs/raw_flow_hy273_hytext_l2_l3_scratch.yaml`
+- `scripts/launch/train_hy273_raw_flow_l2_l3_scratch_ddp4.sh`
+- `tools/calibrate_hy273_l2_l3_losses.py`
+- `tools/verify_hy273_l2_l3_preflight.py`
 - `tests/test_hy273_constraints.py`
+- `tests/test_kimodo273_dataset.py`
 - `tests/test_raw_flow_model.py`
 - `tests/test_raw_flow_sampling.py`
+
+## L2/L3 Scratch Runs
+
+The current loss experiment consists of two independent runs from random initialization:
+
+- L2: semantic block-weighted clean-x0 MSE on four GPUs.
+- L3: the same objective plus meter-space FK/position consistency with a 5K-step warmup, on a separate four GPUs.
+
+Both runs target 200K optimizer steps with global batch 128 and checkpoints at 50K intervals. They share the same rank-0 initialization SHA and deterministic per-rank input trace; neither resumes the archived 300K model.
+
+Launch evidence is versioned in:
+
+- `run_logs/hy273_l2_l3_calibration_scratch_seed3407_n16_final.json`
+- `run_logs/hy273_l2_l3_scratch_preflight_report.json`
+- `run_logs/hy273_l2_l3_scratch_source_manifest.sha256`
+
+The source manifest intentionally contains absolute hashes for the local audited dataset/cache metadata. Recreate those environment-specific entries before launching on a different machine.
 
 The reviewer prompts for the HYText and Stage-2 control patches are in:
 
@@ -71,4 +95,4 @@ The reviewer prompts for the HYText and Stage-2 control patches are in:
 
 ## Data Not Included
 
-This repository does not include raw motion `.npy` files, checkpoints, third-party repositories, or generated training outputs.
+This repository does not include raw motion `.npy` files, checkpoints, complete third-party repositories, or generated training outputs. It includes only the small hash-locked SMPL-X22 skeleton asset required to audit FK semantics.

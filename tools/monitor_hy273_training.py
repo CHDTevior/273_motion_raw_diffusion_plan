@@ -139,7 +139,25 @@ def weighted_percentages(metric: dict[str, float], weights: dict[str, float]) ->
     return {key: value / total * 100.0 for key, value in contrib.items()}
 
 
-def assess(metrics: list[dict[str, float]], gpu: list[dict[str, int]]) -> tuple[str, list[str]]:
+def expected_gpu_indices(run_dir: Path, gpu: list[dict[str, int]]) -> list[int]:
+    trace_path = run_dir / "trace_contract.json"
+    if trace_path.is_file():
+        try:
+            trace = json.loads(trace_path.read_text(encoding="utf-8"))
+            visible = str(trace.get("cuda_visible_devices", ""))
+            indices = [int(value.strip()) for value in visible.split(",") if value.strip()]
+            if indices:
+                return indices
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    return [row["index"] for row in gpu]
+
+
+def assess(
+    metrics: list[dict[str, float]],
+    gpu: list[dict[str, int]],
+    expected_gpus: list[int] | None = None,
+) -> tuple[str, list[str]]:
     reasons: list[str] = []
     if not metrics:
         return "bad", ["no train metrics found"]
@@ -154,9 +172,19 @@ def assess(metrics: list[dict[str, float]], gpu: list[dict[str, int]]) -> tuple[
         previous = [m["loss"] for m in metrics[-10:-5]]
         if sum(recent) / len(recent) > 2.0 * max(sum(previous) / len(previous), 1e-8):
             reasons.append("recent loss >2x previous window")
-    busy = [row for row in gpu if row["memory_used_mb"] > 1000]
-    if gpu and len(busy) < 8:
-        reasons.append(f"only {len(busy)}/8 GPUs have >1GB allocated")
+    if gpu:
+        expected = expected_gpus if expected_gpus is not None else [row["index"] for row in gpu]
+        by_index = {row["index"]: row for row in gpu}
+        missing = [index for index in expected if index not in by_index]
+        idle = [
+            index
+            for index in expected
+            if index in by_index and by_index[index]["memory_used_mb"] <= 1000
+        ]
+        if missing:
+            reasons.append(f"expected GPUs not reported: {missing}")
+        if idle:
+            reasons.append(f"expected GPUs have <=1GB allocated: {idle}")
     return ("bad" if reasons else "ok"), reasons
 
 
@@ -172,8 +200,9 @@ def main() -> None:
     metrics = read_train_metrics(log_path)
     weights = load_weights(run_dir)
     gpu = gpu_status()
+    expected_gpus = expected_gpu_indices(run_dir, gpu)
     ckpt = checkpoint_status(run_dir)
-    status, reasons = assess(metrics, gpu)
+    status, reasons = assess(metrics, gpu, expected_gpus)
     last = metrics[-1] if metrics else {}
     perc = weighted_percentages(last, weights) if last else {}
     record = {
@@ -183,6 +212,7 @@ def main() -> None:
         "last": last,
         "weighted_percent": perc,
         "gpu": gpu,
+        "expected_gpu_indices": expected_gpus,
         "checkpoint": ckpt,
         "log": str(log_path),
         "run_dir": str(run_dir),

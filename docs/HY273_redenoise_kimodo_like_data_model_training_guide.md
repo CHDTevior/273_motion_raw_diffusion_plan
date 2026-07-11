@@ -451,6 +451,43 @@ L_repr = 0.093970197 / 35 * (
 - `train_hy273_raw_flow.py:541-577`
 - `train_hy273_raw_flow.py:624-651`
 
+### 7.3 与 Kimodo 官方 loss 的精确关系
+
+Kimodo 技术报告 Eq. (1) 写的是直接作用于 clean `x0_hat` 的 component-wise SmoothL1：
+
+```text
+L_Kimodo = 10 * SmoothL1(root_position)
+         +  2 * SmoothL1(root_heading)
+         + 10 * SmoothL1(joint_position)
+         +  3 * SmoothL1(joint_velocity)
+         + 10 * SmoothL1(joint_rotation)
+         +  4 * SmoothL1(foot_contact)
+         +  5 * SmoothL1(FK(rotation), joint_position)
+```
+
+所以当前连续五个 block 的相对比例其实与 Kimodo 一致：
+
+| 语义 block | Kimodo | 当前实现 |
+|---|---:|---:|
+| root position | 10 | 10 |
+| root heading | 2 | 2 |
+| joint position | 10 | 10 |
+| joint velocity | 3 | 3 |
+| joint rotation | 10 | 10 |
+
+代码中 rotation 写在 velocity 前面，所以显示为 `10:2:10:10:3`；按 Kimodo 报告的语义顺序重排就是 `10:2:10:3:10`，两者相同。
+
+但当前完整 loss 不是 Kimodo exact loss，而是 rectified-flow 适配版，主要差异为：
+
+1. Kimodo 用 DDPM clean-x0 SmoothL1；当前用 clean-x0 head，但主项在 capped velocity-equivalent space 做 MSE。
+2. Kimodo 直接使用上述 gamma；当前连续主项整体乘 `0.093970197 / 35`，这个尺度来自真实 batch 上的梯度预算校准，不来自 Kimodo。
+3. Kimodo contact 是权重 4 的 SmoothL1；当前 contact 是权重 0.1 的 BCEWithLogits。
+4. Kimodo FK 权重是 5；当前 FK 权重是校准后的 0.07，并有 5K warmup。
+5. 当前额外加入 0.01 root velocity、0.01 joint velocity、0.01 foot-lock，以及 Stage-2 control SmoothL1；这些不在 Kimodo Eq. (1) 中。
+6. Kimodo 公开仓库没有训练 loss 源码，能够确认的是技术报告公式，无法从公开代码进一步确认它内部对各 component 的精确 reduction 细节。
+
+因此准确表述应是：**模型架构、motion representation 和连续 block 相对比例是 Kimodo-like；完整优化目标是为当前 rectified-flow 实验校准过的 Kimodo-ratio loss，不是 Kimodo loss 的逐项复刻。**
+
 ---
 
 ## 8. 完整 loss

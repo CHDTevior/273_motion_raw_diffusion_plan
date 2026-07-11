@@ -6,8 +6,13 @@ from argparse import Namespace
 import pytest
 import torch
 
-from models.raw_motion.hy273_constraints import build_synthetic_control_batch
+from models.raw_motion.hy273_constraints import (
+    KimodoControlCurriculum,
+    build_kimodo_control_curriculum_batch,
+    build_synthetic_control_batch,
+)
 from models.raw_motion.hy273_slices import (
+    CONTACT_SLICE,
     DIM_HY273,
     HEADING_SLICE,
     JOINT_POS_SLICE,
@@ -16,12 +21,18 @@ from models.raw_motion.hy273_slices import (
     joint_pos_slice_for,
 )
 from sample_hy273_raw import resolve_endpoint_protocol
+from eval_hy273_raw_control import phase2_distribution_conditioned_on_control
 from train_hy273_raw_flow import (
+    apply_deterministic_text_dropout,
     build_arg_parser,
+    create_model,
     explicit_cli_destinations,
+    load_yaml,
     merge_config,
     validate_ema_contract,
+    validate_execution_contract,
     validate_resume_contract,
+    validate_run_name,
 )
 
 
@@ -113,6 +124,150 @@ def test_endpoint_root_reference_can_only_be_disabled_explicitly() -> None:
     frame = int(torch.where(result.motion_mask[0].any(dim=-1))[0].item())
     assert not result.motion_mask[0, frame, ROOT_SLICE.start : HEADING_SLICE.stop].any()
     assert _selected_joint_ids(result.motion_mask[0, frame])
+
+
+def test_kimodo_control_curriculum_probabilities_and_progressive_keyframes() -> None:
+    batch = 4000
+    motion = torch.randn(batch, 40, DIM_HY273)
+    lengths = torch.full((batch,), 40)
+    config = KimodoControlCurriculum(
+        endpoint_preset="five_point",
+        max_sparse_keyframes=20,
+    )
+    start = build_kimodo_control_curriculum_batch(
+        motion,
+        lengths,
+        progress=0.0,
+        config=config,
+        generator=torch.Generator().manual_seed(123),
+    )
+    none_fraction = sum(name == "none" for name in start.mode_ids) / batch
+    mixed_fraction = sum(name.startswith("mixed:") for name in start.mode_ids) / batch
+    assert none_fraction == pytest.approx(0.10, abs=0.025)
+    assert mixed_fraction == pytest.approx(0.25, abs=0.03)
+    for idx, name in enumerate(start.mode_ids):
+        if name == "root_sparse":
+            frames = torch.where(start.motion_mask[idx].any(dim=-1))[0]
+            assert frames.numel() == 1
+            assert not start.motion_mask[idx, frames[0], ROOT_SLICE.start + 1]
+
+    end = build_kimodo_control_curriculum_batch(
+        motion[:512],
+        lengths[:512],
+        progress=1.0,
+        config=config,
+        generator=torch.Generator().manual_seed(321),
+    )
+    sparse_counts = [
+        int(end.motion_mask[idx].any(dim=-1).sum())
+        for idx, name in enumerate(end.mode_ids)
+        if name in {"root_sparse", "endpoints", "fullpose"}
+    ]
+    assert sparse_counts and max(sparse_counts) > 1
+    assert max(sparse_counts) <= 20
+
+
+def test_last_executed_phase2_update_reaches_full_curriculum_progress() -> None:
+    start_step = 200_000
+    curriculum_steps = 200_000
+    final_optimizer_step = 399_999
+    progress = (final_optimizer_step - start_step + 1) / curriculum_steps
+    assert progress == 1.0
+
+
+def test_kimodo_like_architecture_rejects_velocity_prediction() -> None:
+    args = build_arg_parser().parse_args([])
+    args.architecture = "redenoise_kimodo_like"
+    args.prediction_type = "velocity"
+    with pytest.raises(ValueError, match="requires --prediction_type x0"):
+        create_model(args)
+
+
+def test_stage2_config_does_not_claim_untrained_contact_control() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args(["--config", "configs/redenoise_kimodo_like_stage2_control.yaml"])
+    args = merge_config(
+        args,
+        {
+            "model": {"architecture": "redenoise_kimodo_like"},
+            "control": {"training_phase": "control"},
+            "loss": {"control_contact": 0.0},
+        },
+        explicit_cli={"config"},
+    )
+    assert args.control_contact_loss_weight == 0.0
+
+
+def test_public_v1_control_builder_never_injects_root_y_or_contacts() -> None:
+    motion = torch.randn(512, 40, DIM_HY273)
+    result = build_synthetic_control_batch(
+        motion,
+        lengths=torch.full((512,), 40),
+        modes=("root_sparse", "root_dense", "endpoints", "fullpose", "mixed"),
+        endpoint_preset="five_point",
+        generator=torch.Generator().manual_seed(9),
+    )
+    assert not result.motion_mask[..., CONTACT_SLICE].any()
+    for batch_idx, mode in enumerate(result.mode_ids):
+        if mode in {"root_sparse", "root_dense"}:
+            assert not result.motion_mask[batch_idx, :, ROOT_SLICE.start + 1].any()
+    assert any(mode == "root_dense" for mode in result.mode_ids)
+    assert any(mode.startswith("mixed:") for mode in result.mode_ids)
+
+
+def test_control_evaluation_uses_phase2_distribution_conditioned_on_control() -> None:
+    assert phase2_distribution_conditioned_on_control(0.10, 0.25) == pytest.approx(
+        0.25 / 0.90
+    )
+
+
+def test_text_dropout_is_shared_even_without_deterministic_trace() -> None:
+    texts, dropped, internal_probability = apply_deterministic_text_dropout(
+        ["walk", "run"], 1.0, torch.device("cpu"), None
+    )
+    assert texts == ["", ""]
+    assert dropped is not None and dropped.all()
+    assert internal_probability == 0.0
+
+
+def test_run_name_rejects_paths() -> None:
+    assert validate_run_name("hy273.valid-run_01") == "hy273.valid-run_01"
+    for invalid in ("/tmp/run", "../run", "a/b", ""):
+        with pytest.raises(ValueError, match="safe run basename"):
+            validate_run_name(invalid)
+
+
+def test_final_execution_contract_rejects_schedule_and_phase_bypasses() -> None:
+    parser = build_arg_parser()
+    stage1 = parser.parse_args(["--config", "configs/redenoise_kimodo_like_stage1.yaml"])
+    stage1 = merge_config(
+        stage1,
+        load_yaml(stage1.config),
+        explicit_cli={"config"},
+    )
+    stage1.execution_contract = "stage1_production"
+    validate_execution_contract(stage1)
+    stage1.max_steps = 1
+    with pytest.raises(RuntimeError, match="max_steps=200000"):
+        validate_execution_contract(stage1)
+    stage1.execution_contract = "stage1_pilot"
+    validate_execution_contract(stage1)
+
+    stage2 = parser.parse_args(["--config", "configs/redenoise_kimodo_like_stage2_control.yaml"])
+    stage2 = merge_config(
+        stage2,
+        load_yaml(stage2.config),
+        explicit_cli={"config"},
+    )
+    stage2.execution_contract = "stage2_production"
+    validate_execution_contract(stage2)
+    stage2.training_phase = "text_only"
+    with pytest.raises(RuntimeError, match="requires the control phase"):
+        validate_execution_contract(stage2)
+    stage2.training_phase = "control"
+    stage2.control_modes = "none,root_sparse"
+    with pytest.raises(RuntimeError, match="frozen v1 control mode set"):
+        validate_execution_contract(stage2)
 
 
 def test_resume_contract_rejects_shape_preserving_text_semantic_change() -> None:

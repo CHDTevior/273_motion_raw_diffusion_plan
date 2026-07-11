@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,12 @@ from models.raw_motion.flow_schedule import (
     sample_timesteps,
     smooth_l1_masked,
 )
-from models.raw_motion.hy273_constraints import build_synthetic_control_batch
+from models.raw_motion.asset_integrity import verify_asset_manifest
+from models.raw_motion.hy273_constraints import (
+    KimodoControlCurriculum,
+    build_kimodo_control_curriculum_batch,
+    build_synthetic_control_batch,
+)
 from models.raw_motion.hy273_normalizer import HY273Normalizer, apply_kimodo_training_transform
 from models.raw_motion.hy273_slices import (
     CONTACT_JOINTS,
@@ -96,6 +102,56 @@ def seed_all(seed: int, rank: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def validate_run_name(name: str) -> str:
+    value = str(name)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+        raise ValueError("--name must be a safe run basename")
+    return value
+
+
+def validate_execution_contract(args: argparse.Namespace) -> None:
+    contract = str(getattr(args, "execution_contract", "none"))
+    if contract == "none":
+        return
+    phase = str(args.training_phase)
+    modes = {item.strip() for item in str(args.control_modes).split(",") if item.strip()}
+    max_steps = int(args.max_steps)
+    if contract.startswith("stage1_"):
+        if phase != "text_only" or modes != {"none"}:
+            raise RuntimeError(f"{contract} requires text_only with only the none control mode")
+        if float(args.control_cont_loss_weight) != 0.0 or float(
+            args.control_contact_loss_weight
+        ) != 0.0:
+            raise RuntimeError(f"{contract} requires zero controlled-entry losses")
+        if contract == "stage1_production" and max_steps != 200_000:
+            raise RuntimeError("stage1_production requires max_steps=200000")
+        if contract == "stage1_pilot" and not 0 < max_steps < 200_000:
+            raise RuntimeError("stage1_pilot requires 0 < max_steps < 200000")
+        return
+    if phase != "control":
+        raise RuntimeError(f"{contract} requires the control phase")
+    expected_modes = {
+        "none",
+        "root_sparse",
+        "root_dense",
+        "endpoints",
+        "fullpose",
+        "mixed",
+    }
+    if modes != expected_modes:
+        raise RuntimeError(f"{contract} requires the frozen v1 control mode set")
+    if float(args.control_cont_loss_weight) <= 0.0:
+        raise RuntimeError(f"{contract} requires a positive continuous control loss")
+    if float(args.control_contact_loss_weight) != 0.0:
+        raise RuntimeError(f"{contract} requires zero contact-control loss for v1")
+    if int(args.control_curriculum_start_step) != 200_000:
+        raise RuntimeError(f"{contract} requires curriculum_start_step=200000")
+    if contract == "stage2_production" and max_steps != 400_000:
+        raise RuntimeError("stage2_production requires max_steps=400000")
+    if contract == "stage2_pilot" and not 200_000 < max_steps < 400_000:
+        raise RuntimeError("stage2_pilot requires 200000 < max_steps < 400000")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     # Config precedence depends on exact option identities, so accepting argparse
     # abbreviations would let a parsed CLI value be mistaken for an absent option.
@@ -137,12 +193,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--denoiser_p_mean", type=float, default=0.0)
     p.add_argument("--denoiser_p_std", type=float, default=1.0)
     p.add_argument("--prediction_type", choices=["velocity", "x0"], default="x0")
+    p.add_argument(
+        "--architecture",
+        choices=["one_stage", "redenoise_kimodo_like"],
+        default="one_stage",
+    )
     p.add_argument("--hidden_dim", type=int, default=1024)
     p.add_argument("--num_heads", type=int, default=8)
     p.add_argument("--depth_double", type=int, default=6)
     p.add_argument("--depth_single", type=int, default=12)
     p.add_argument("--mlp_ratio", type=float, default=2.0)
     p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--root_depth_double", type=int, default=3)
+    p.add_argument("--root_depth_single", type=int, default=6)
+    p.add_argument("--body_depth_double", type=int, default=3)
+    p.add_argument("--body_depth_single", type=int, default=6)
+    p.add_argument("--motion_stats_dir", default="")
+    p.add_argument("--local_root_stats_dir", default="")
+    p.add_argument("--stats_variance_eps", type=float, default=0.0)
+    p.add_argument("--stats_manifest_sha256", default="")
+    p.add_argument("--asset_manifest_path", default="")
+    p.add_argument("--asset_manifest_sha256", default="")
+    p.add_argument("--detach_root_bridge", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--text_encoder", choices=["clip", "hy_cache", "hytext_cache", "qwen_clip_cache", "none"], default="clip")
     p.add_argument("--clip_path", default="checkpoints/clip/ViT-B-32.pt")
     p.add_argument("--clip_version", default="ViT-B/32")
@@ -158,6 +230,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--root_origin_shift", action="store_true")
     p.add_argument("--no_root_origin_shift", action="store_true")
     p.add_argument("--control_modes", default="none,root,endpoints,fullpose,mixed")
+    p.add_argument(
+        "--training_phase",
+        choices=["text_only", "control"],
+        default="text_only",
+    )
+    p.add_argument("--control_curriculum_start_step", type=int, default=200000)
+    p.add_argument("--control_curriculum_steps", type=int, default=200000)
+    p.add_argument("--control_none_prob", type=float, default=0.10)
+    p.add_argument("--control_mixed_prob", type=float, default=0.25)
+    p.add_argument("--control_dense_min_fraction", type=float, default=0.25)
+    p.add_argument(
+        "--control_include_endpoint_rotations",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     p.add_argument("--max_control_keyframes", type=int, default=8)
     p.add_argument("--endpoint_preset", choices=["kimodo_ee", "five_point"], default="kimodo_ee")
     p.add_argument(
@@ -209,7 +296,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--deterministic_trace", action="store_true")
     p.add_argument("--trace_seed", type=int, default=3407)
     p.add_argument("--trace_hash_steps", type=int, default=100)
-    p.add_argument("--resume_mode", choices=["strict", "loss_fork"], default="strict")
+    p.add_argument(
+        "--resume_mode",
+        choices=["strict", "loss_fork", "phase_transition"],
+        default="strict",
+    )
     p.add_argument("--expected_resume_step", type=int, default=-1)
     p.add_argument("--resume_epoch", type=int, default=-1)
     p.add_argument("--resume_step_in_epoch", type=int, default=-1)
@@ -217,6 +308,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume_sha256", default="")
     p.add_argument("--expected_initial_model_sha256", default="")
     p.add_argument("--source_manifest_sha256", default="")
+    p.add_argument(
+        "--execution_contract",
+        choices=[
+            "none",
+            "stage1_production",
+            "stage1_pilot",
+            "stage2_production",
+            "stage2_pilot",
+        ],
+        default="none",
+    )
     p.add_argument("--self_conditioning", action="store_true")
     p.add_argument("--self_cond_train_prob", type=float, default=0.5)
     p.add_argument("--self_cond_mode", default="add_proj")
@@ -261,12 +363,26 @@ def merge_config(
         "denoiser_p_mean": "train.denoiser_p_mean",
         "denoiser_p_std": "train.denoiser_p_std",
         "prediction_type": "model.prediction_type",
+        "architecture": "model.architecture",
         "hidden_dim": "model.hidden_dim",
         "num_heads": "model.num_heads",
         "depth_double": "model.depth_double",
         "depth_single": "model.depth_single",
         "mlp_ratio": "model.mlp_ratio",
         "dropout": "model.dropout",
+        "root_depth_double": "model.root_depth_double",
+        "root_depth_single": "model.root_depth_single",
+        "body_depth_double": "model.body_depth_double",
+        "body_depth_single": "model.body_depth_single",
+        "motion_stats_dir": "normalization.motion_stats_dir",
+        "local_root_stats_dir": "normalization.local_root_stats_dir",
+        "stats_variance_eps": "normalization.variance_eps",
+        "stats_manifest_sha256": "normalization.manifest_sha256",
+        "asset_manifest_path": "assets.manifest_path",
+        "asset_manifest_sha256": "assets.manifest_sha256",
+        "source_manifest_sha256": "assets.source_manifest_sha256",
+        "expected_initial_model_sha256": "assets.expected_initial_model_sha256",
+        "detach_root_bridge": "model.detach_root_bridge",
         "text_encoder": "text.encoder",
         "clip_path": "text.clip_path",
         "clip_version": "text.clip_version",
@@ -302,6 +418,13 @@ def merge_config(
         "trace_seed": "train.trace_seed",
         "trace_hash_steps": "train.trace_hash_steps",
         "control_modes": "control.modes",
+        "training_phase": "control.training_phase",
+        "control_curriculum_start_step": "control.curriculum_start_step",
+        "control_curriculum_steps": "control.curriculum_steps",
+        "control_none_prob": "control.none_prob",
+        "control_mixed_prob": "control.mixed_prob",
+        "control_dense_min_fraction": "control.dense_min_fraction",
+        "control_include_endpoint_rotations": "control.include_endpoint_rotations",
         "max_control_keyframes": "control.max_keyframes",
         "endpoint_preset": "control.endpoint_preset",
         "endpoint_subset_mode": "control.endpoint_subset_mode",
@@ -338,12 +461,10 @@ def merge_config(
     return args
 
 
-def create_model(args: argparse.Namespace) -> HY273RawFlow:
-    return HY273RawFlow(
+def create_model(args: argparse.Namespace) -> torch.nn.Module:
+    common = dict(
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
-        depth_double=args.depth_double,
-        depth_single=args.depth_single,
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
         text_encoder=args.text_encoder,
@@ -356,9 +477,33 @@ def create_model(args: argparse.Namespace) -> HY273RawFlow:
         hytext_max_open_shards=getattr(args, "hytext_max_open_shards", 8),
         hytext_strict_cache=not bool(getattr(args, "hytext_allow_cache_miss", False)),
         self_conditioning=args.self_conditioning,
-        self_cond_mode=args.self_cond_mode,
         self_cond_scale=args.self_cond_scale,
     )
+    if str(getattr(args, "architecture", "one_stage")) == "one_stage":
+        return HY273RawFlow(
+            depth_double=args.depth_double,
+            depth_single=args.depth_single,
+            self_cond_mode=args.self_cond_mode,
+            **common,
+        )
+    if args.architecture == "redenoise_kimodo_like":
+        if str(args.prediction_type) != "x0":
+            raise ValueError("redenoise_kimodo_like requires --prediction_type x0")
+        from models.raw_motion.kimodo_like_flow_dit import HY273RedenoiseKimodoLike
+
+        return HY273RedenoiseKimodoLike(
+            root_depth_double=args.root_depth_double,
+            root_depth_single=args.root_depth_single,
+            body_depth_double=args.body_depth_double,
+            body_depth_single=args.body_depth_single,
+            motion_stats_dir=args.motion_stats_dir,
+            local_root_stats_dir=args.local_root_stats_dir,
+            fps=args.semantic_loss_fps,
+            stats_variance_eps=args.stats_variance_eps,
+            detach_root_bridge=args.detach_root_bridge,
+            **common,
+        )
+    raise ValueError(f"Unknown architecture: {args.architecture}")
 
 
 def continuous_loss_weights(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -595,6 +740,7 @@ def save_checkpoint(
     step: int,
     ema_state: dict[str, torch.Tensor] | None = None,
     train_state: dict[str, Any] | None = None,
+    normalizer_state: dict[str, torch.Tensor] | None = None,
 ) -> None:
     raw_model = model.module if isinstance(model, DDP) else model
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -611,6 +757,10 @@ def save_checkpoint(
         payload["epoch"] = int(train_state["next_epoch"])
     if ema_state is not None:
         payload["ema"] = {key: value.detach().cpu() for key, value in ema_state.items()}
+    if normalizer_state is not None:
+        payload["normalizer"] = {
+            key: value.detach().cpu().clone() for key, value in normalizer_state.items()
+        }
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
 
@@ -664,12 +814,24 @@ RESUME_CONTRACT_FIELDS = (
     "denoiser_p_mean",
     "denoiser_p_std",
     "prediction_type",
+    "architecture",
     "hidden_dim",
     "num_heads",
     "depth_double",
     "depth_single",
     "mlp_ratio",
     "dropout",
+    "root_depth_double",
+    "root_depth_single",
+    "body_depth_double",
+    "body_depth_single",
+    "motion_stats_dir",
+    "local_root_stats_dir",
+    "stats_variance_eps",
+    "stats_manifest_sha256",
+    "asset_manifest_path",
+    "asset_manifest_sha256",
+    "detach_root_bridge",
     "text_encoder",
     "max_text_tokens",
     "hytext_cache_dir",
@@ -681,6 +843,13 @@ RESUME_CONTRACT_FIELDS = (
     "random_first_heading",
     "root_origin_shift",
     "control_modes",
+    "training_phase",
+    "control_curriculum_start_step",
+    "control_curriculum_steps",
+    "control_none_prob",
+    "control_mixed_prob",
+    "control_dense_min_fraction",
+    "control_include_endpoint_rotations",
     "max_control_keyframes",
     "endpoint_preset",
     "endpoint_subset_mode",
@@ -783,6 +952,23 @@ def validate_ema_contract(
     return ema_state
 
 
+def validate_normalizer_contract(
+    normalizer: HY273Normalizer, checkpoint_state: Any, path: str
+) -> None:
+    if not isinstance(checkpoint_state, dict):
+        raise RuntimeError(f"Checkpoint is missing its normalizer state: {path}")
+    current = normalizer.state_dict()
+    if set(current) != set(checkpoint_state):
+        raise RuntimeError(
+            f"Checkpoint normalizer keys mismatch for {path}: "
+            f"checkpoint={sorted(checkpoint_state)}, current={sorted(current)}"
+        )
+    for key, value in current.items():
+        saved = checkpoint_state[key]
+        if not torch.is_tensor(saved) or not torch.equal(value.cpu(), saved.cpu()):
+            raise RuntimeError(f"Checkpoint normalizer tensor mismatch for {path}: {key}")
+
+
 @torch.no_grad()
 def init_ema_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     raw_model = model.module if isinstance(model, DDP) else model
@@ -855,8 +1041,6 @@ def apply_deterministic_text_dropout(
     device: torch.device,
     generator: torch.Generator | None,
 ) -> tuple[list[str], torch.Tensor | None, float]:
-    if generator is None:
-        return texts, None, float(probability)
     dropped = torch.rand(len(texts), device=device, generator=generator) < float(probability)
     output = ["" if bool(dropped[i].item()) else text for i, text in enumerate(texts)]
     return output, dropped, 0.0
@@ -1009,16 +1193,40 @@ def compute_step_loss(
     )
     x0_un = transform.motion
     c_dir = transform.c_dir
-    controls = build_synthetic_control_batch(
-        x0_un,
-        lengths=lengths,
-        modes=tuple(m.strip() for m in args.control_modes.split(",") if m.strip()),
-        endpoint_preset=args.endpoint_preset,
-        endpoint_subset_mode=args.endpoint_subset_mode,
-        max_keyframes=args.max_control_keyframes,
-        include_root_ref_for_endpoints=args.endpoint_root_ref_mode == "kimodo_hidden_root",
-        generator=control_generator,
-    )
+    if str(getattr(args, "training_phase", "text_only")) == "control":
+        curriculum_steps = max(1, int(args.control_curriculum_steps))
+        # The first phase-2 update is 1/curriculum_steps and the final executed
+        # update is exactly 1.0, so max_sparse_keyframes is reachable in-run.
+        curriculum_progress = (
+            int(optimizer_step) - int(args.control_curriculum_start_step) + 1
+        ) / float(curriculum_steps)
+        controls = build_kimodo_control_curriculum_batch(
+            x0_un,
+            lengths=lengths,
+            progress=curriculum_progress,
+            config=KimodoControlCurriculum(
+                none_prob=float(args.control_none_prob),
+                mixed_prob=float(args.control_mixed_prob),
+                max_sparse_keyframes=int(args.max_control_keyframes),
+                dense_min_fraction=float(args.control_dense_min_fraction),
+                endpoint_preset=args.endpoint_preset,
+                endpoint_subset_mode=args.endpoint_subset_mode,
+                include_root_ref_for_endpoints=args.endpoint_root_ref_mode == "kimodo_hidden_root",
+                include_endpoint_rotations=bool(args.control_include_endpoint_rotations),
+            ),
+            generator=control_generator,
+        )
+    else:
+        controls = build_synthetic_control_batch(
+            x0_un,
+            lengths=lengths,
+            modes=("none",),
+            endpoint_preset=args.endpoint_preset,
+            endpoint_subset_mode=args.endpoint_subset_mode,
+            max_keyframes=args.max_control_keyframes,
+            include_root_ref_for_endpoints=args.endpoint_root_ref_mode == "kimodo_hidden_root",
+            generator=control_generator,
+        )
     obs_un = controls.observed_motion
     motion_mask = controls.motion_mask.to(device=device)
     x0 = normalizer.normalize(x0_un)
@@ -1056,6 +1264,12 @@ def compute_step_loss(
     )
     model_in = state["model_in"]
     x_self_cond = None
+    model_texts, text_dropped, model_text_drop_prob = apply_deterministic_text_dropout(
+        list(batch["texts"]),
+        float(args.text_dropout_prob),
+        device,
+        text_drop_generator,
+    )
 
     use_sc = bool(args.self_conditioning) and float(args.self_cond_train_prob) > 0.0
     use_sc_this_step = False
@@ -1069,10 +1283,10 @@ def compute_step_loss(
                     model_in,
                     t=timesteps,
                     c_dir=c_dir,
-                    text=batch["texts"],
+                    text=model_texts,
                     length_mask=valid,
                     x_self_cond=None,
-                    text_drop_prob=0.0,
+                    text_drop_prob=model_text_drop_prob,
                 )
             x0_hat0_cont = predict_clean_cont(
                 state["z_cont_imp"],
@@ -1083,13 +1297,6 @@ def compute_step_loss(
             x0_hat0 = torch.cat([x0_hat0_cont, torch.sigmoid(pred0[..., CONTACT_SLICE])], dim=-1)
             mask_f = motion_mask.to(dtype=x0.dtype)
             x_self_cond = (x0_hat0 * (1.0 - mask_f) + obs * mask_f).detach()
-
-    model_texts, text_dropped, model_text_drop_prob = apply_deterministic_text_dropout(
-        list(batch["texts"]),
-        float(args.text_dropout_prob),
-        device,
-        text_drop_generator,
-    )
 
     with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
         pred = model(
@@ -1279,6 +1486,8 @@ def main() -> None:
     args = merge_config(args, cfg, explicit_cli=explicit_cli)
     if not args.data_root:
         raise ValueError("--data_root is required")
+    args.name = validate_run_name(args.name)
+    validate_execution_contract(args)
     if int(args.gradient_accumulation_steps) < 1:
         raise ValueError("--gradient_accumulation_steps must be >= 1")
     if args.representation_loss_mode == "semantic_weighted" and args.prediction_type != "x0":
@@ -1291,13 +1500,56 @@ def main() -> None:
         raise ValueError("--fk_consistency_loss_weight must be non-negative")
     if int(args.fk_consistency_warmup_steps) < 0:
         raise ValueError("--fk_consistency_warmup_steps must be non-negative")
-    if args.resume_mode == "loss_fork" and not args.resume:
-        raise ValueError("--resume_mode loss_fork requires --resume")
-    if args.resume_mode == "loss_fork" and not str(args.resume_sha256).strip():
-        raise ValueError("--resume_mode loss_fork requires --resume_sha256")
+    if (
+        args.architecture == "redenoise_kimodo_like"
+        and str(getattr(args, "training_phase", "text_only")) == "control"
+        and float(args.control_contact_loss_weight) != 0.0
+    ):
+        raise ValueError(
+            "redenoise_kimodo_like v1 does not expose contact as a control mode; "
+            "--control_contact_loss_weight must be 0"
+        )
+    if args.resume_mode in {"loss_fork", "phase_transition"} and not args.resume:
+        raise ValueError(f"--resume_mode {args.resume_mode} requires --resume")
+    if args.resume_mode in {"loss_fork", "phase_transition"} and not str(args.resume_sha256).strip():
+        raise ValueError(f"--resume_mode {args.resume_mode} requires --resume_sha256")
     if args.resume_sha256 and not args.resume:
         raise ValueError("--resume_sha256 requires --resume")
+    if args.stats_manifest_sha256:
+        stats_manifest = Path(args.motion_stats_dir).resolve().parent / "manifest.json"
+        actual_stats_sha = sha256_file(stats_manifest)
+        expected_stats_sha = str(args.stats_manifest_sha256).strip().lower()
+        if actual_stats_sha != expected_stats_sha:
+            raise RuntimeError(
+                "Statistics manifest SHA256 mismatch: "
+                f"expected={expected_stats_sha}, actual={actual_stats_sha}, path={stats_manifest}"
+            )
     device, rank, world, local_rank = setup_distributed()
+    if args.architecture == "redenoise_kimodo_like" and not args.asset_manifest_sha256:
+        raise ValueError("redenoise_kimodo_like requires --asset_manifest_sha256")
+    if args.asset_manifest_path:
+        asset_result: list[dict[str, str] | None] = [None]
+        if rank == 0:
+            try:
+                verified = verify_asset_manifest(
+                    args.asset_manifest_path,
+                    expected_manifest_sha256=args.asset_manifest_sha256,
+                )
+                asset_result[0] = {"error": "", "files": str(len(verified["files"]))}
+            except (OSError, ValueError, RuntimeError, KeyError) as exc:
+                asset_result[0] = {"error": str(exc), "files": "0"}
+        if world > 1:
+            dist.broadcast_object_list(asset_result, src=0)
+        asset_status = asset_result[0]
+        if not isinstance(asset_status, dict) or asset_status.get("error"):
+            raise RuntimeError(
+                "Training asset verification failed: "
+                f"{None if asset_status is None else asset_status.get('error')}"
+            )
+        if rank == 0:
+            print(f"[assets] verified_files={asset_status['files']}", flush=True)
+    elif args.architecture == "redenoise_kimodo_like":
+        raise ValueError("redenoise_kimodo_like requires --asset_manifest_path")
     if args.resume_sha256:
         resume_hash_result: list[dict[str, str] | None] = [None]
         if rank == 0:
@@ -1357,6 +1609,11 @@ def main() -> None:
         )
     optimizer_steps_per_epoch = usable_micro_batches // accumulation_steps
     effective_global_batch = int(world * args.batch_size * accumulation_steps)
+    normalizer = HY273Normalizer.from_data_root(
+        args.data_root,
+        stats_dir=args.motion_stats_dir or None,
+        variance_eps=float(args.stats_variance_eps),
+    ).to(device)
     model = create_model(args)
     initial_model_sha256 = ""
     if rank == 0 and not args.resume:
@@ -1408,6 +1665,21 @@ def main() -> None:
                 "velocity_loss_t_eps",
                 "source_manifest_sha256",
             )
+        elif args.resume_mode == "phase_transition":
+            if str(getattr(args, "training_phase", "")) != "control":
+                raise RuntimeError("phase_transition resume requires --training_phase control")
+            checkpoint_step = int(ckpt.get("step", -1))
+            if checkpoint_step != int(args.control_curriculum_start_step):
+                raise RuntimeError(
+                    "phase_transition checkpoint step must equal control_curriculum_start_step: "
+                    f"checkpoint={checkpoint_step}, requested={args.control_curriculum_start_step}"
+                )
+            allowed_mismatches = (
+                "training_phase",
+                "control_modes",
+                "control_cont_loss_weight",
+                "control_contact_loss_weight",
+            )
         validate_resume_contract(
             args,
             ckpt.get("args"),
@@ -1415,6 +1687,7 @@ def main() -> None:
             allowed_mismatches=allowed_mismatches,
             allowed_missing_fields=allowed_missing_fields,
         )
+        validate_normalizer_contract(normalizer, ckpt.get("normalizer"), args.resume)
         raw_model = model.module if isinstance(model, DDP) else model
         try:
             raw_model.load_state_dict(ckpt["model"], strict=True)
@@ -1458,7 +1731,6 @@ def main() -> None:
         )
     if bool(args.ema) and ema_state is None:
         ema_state = init_ema_state(model)
-    normalizer = HY273Normalizer.from_data_root(args.data_root).to(device)
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and args.amp_dtype == "fp16")
     if rank == 0 and args.deterministic_trace:
@@ -1617,6 +1889,7 @@ def main() -> None:
                         global_step,
                         ema_state=ema_state,
                         train_state=current_train_state,
+                        normalizer_state=normalizer.state_dict(),
                     )
                     save_checkpoint(
                         out_dir / "model" / "latest.pt",
@@ -1627,6 +1900,7 @@ def main() -> None:
                         global_step,
                         ema_state=ema_state,
                         train_state=current_train_state,
+                        normalizer_state=normalizer.state_dict(),
                     )
                 optimizer.zero_grad(set_to_none=True)
                 group_metrics = {}
@@ -1646,6 +1920,7 @@ def main() -> None:
                 global_step,
                 ema_state=ema_state,
                 train_state=current_train_state,
+                normalizer_state=normalizer.state_dict(),
             )
     finally:
         cleanup_distributed()

@@ -13,6 +13,7 @@ from .hy273_slices import (
 )
 from .hy273_normalizer import HY273Normalizer
 from .raw_flow_dit import HY273RawFlow
+from .kimodo_like_flow_dit import HY273RedenoiseKimodoLike
 
 __all__ = [
     "CONTACT_SLICE",
@@ -22,6 +23,7 @@ __all__ = [
     "HEADING_SLICE",
     "HY273Normalizer",
     "HY273RawFlow",
+    "HY273RedenoiseKimodoLike",
     "JOINT_POS_SLICE",
     "NUM_JOINTS",
     "ROOT_SLICE",

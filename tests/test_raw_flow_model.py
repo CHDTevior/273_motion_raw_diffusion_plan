@@ -7,6 +7,8 @@ import torch
 
 from models.raw_motion.flow_schedule import build_flow_state, clean_from_velocity
 from models.raw_motion.hy273_normalizer import HY273Normalizer, apply_yaw_rotation, transform_equivariance_error
+from models.raw_motion.hy273_root_conditioning import KimodoRootConditioner
+from models.raw_motion.kimodo_like_flow_dit import HY273RedenoiseKimodoLike
 from models.raw_motion.hy273_slices import load_smplx22_neutral_joints, matrix_to_cont6d
 from models.raw_motion.hytext_cache import hytext_key
 from models.raw_motion.raw_flow_dit import HY273RawFlow
@@ -16,6 +18,7 @@ from train_hy273_raw_flow import (
     effective_fk_consistency_weight,
     fk_position_consistency_loss,
     hash_model_state,
+    load_yaml,
     make_train_state,
     merge_config,
     predict_clean_cont,
@@ -26,6 +29,8 @@ from train_hy273_raw_flow import (
     save_checkpoint,
     sha256_file,
     trace_stream_seed,
+    validate_normalizer_contract,
+    validate_resume_contract,
 )
 
 
@@ -59,6 +64,35 @@ def _write_fake_hytext_cache(tmp_path):
     (cache_dir / "index.json").write_text(json.dumps(index))
     (cache_dir / "manifest.json").write_text(json.dumps({"format": "hytext_memmap_v1"}))
     return cache_dir
+
+
+def _write_root_stats(tmp_path):
+    full = tmp_path / "stats" / "full"
+    local = tmp_path / "stats" / "local_root"
+    full.mkdir(parents=True)
+    local.mkdir(parents=True)
+    np.save(full / "Mean.npy", np.zeros(273, dtype=np.float32))
+    np.save(full / "Std.npy", np.ones(273, dtype=np.float32))
+    np.save(local / "Mean.npy", np.zeros(4, dtype=np.float32))
+    np.save(local / "Std.npy", np.ones(4, dtype=np.float32))
+    return full, local
+
+
+def _kimodo_like_model(tmp_path):
+    full, local = _write_root_stats(tmp_path)
+    return HY273RedenoiseKimodoLike(
+        hidden_dim=64,
+        num_heads=4,
+        root_depth_double=1,
+        root_depth_single=1,
+        body_depth_double=1,
+        body_depth_single=1,
+        text_encoder="none",
+        max_text_tokens=4,
+        motion_stats_dir=str(full),
+        local_root_stats_dir=str(local),
+        stats_variance_eps=0.0,
+    )
 
 
 def test_forward_without_self_conditioning_shape_finite():
@@ -111,6 +145,70 @@ def test_forward_with_cached_hytext_shape_finite(tmp_path):
     assert out_drop.shape == (2, 8, 273)
     assert torch.isfinite(out).all()
     assert torch.isfinite(out_drop).all()
+
+
+def test_kimodo_like_forward_shape_and_detached_root_bridge(tmp_path):
+    model = _kimodo_like_model(tmp_path)
+    model.train()
+    x = torch.randn(2, 8, 546)
+    x[..., 273:] = 0
+    valid = torch.ones(2, 8, dtype=torch.bool)
+    out = model(x, t=torch.rand(2), text=["walk", "run"], length_mask=valid)
+    assert out.shape == (2, 8, 273)
+    assert torch.isfinite(out).all()
+    out[..., 5:].square().mean().backward()
+    root_grad = sum(
+        float(param.grad.abs().sum())
+        for param in model.root_backbone.parameters()
+        if param.grad is not None
+    )
+    assert root_grad == 0.0
+    assert any(param.grad is not None for param in model.body_backbone.parameters())
+
+
+def test_kimodo_like_masked_root_bridge_uses_complete_root_prediction(tmp_path):
+    model = _kimodo_like_model(tmp_path)
+    model.train()
+    x = torch.randn(1, 8, 546)
+    x[..., 273:] = 0
+    x[:, 3, 273:278] = 1
+    x[:, 3, :5] = torch.tensor([80.0, 90.0, 100.0, 0.0, 1.0])
+    valid = torch.ones(1, 8, dtype=torch.bool)
+    details = model(
+        x,
+        t=torch.tensor([0.5]),
+        text=["walk"],
+        length_mask=valid,
+        return_details=True,
+    )
+    assert torch.equal(details.root_for_body, details.root_prediction_raw)
+    assert not torch.equal(details.root_for_body[:, 3], x[:, 3, :5])
+
+    details.prediction[..., 5:].square().mean().backward()
+    root_grad = sum(
+        float(param.grad.abs().sum())
+        for param in model.root_backbone.parameters()
+        if param.grad is not None
+    )
+    assert root_grad == 0.0
+
+
+def test_global_to_local_root_wrap_and_variable_length_boundaries(tmp_path):
+    full, local = _write_root_stats(tmp_path)
+    conditioner = KimodoRootConditioner(full, local, fps=30.0, variance_eps=0.0)
+    root = torch.zeros(2, 3, 5)
+    angles = torch.deg2rad(torch.tensor([[179.0, -179.0, -177.0], [45.0, 0.0, 0.0]]))
+    root[..., 3] = torch.cos(angles)
+    root[..., 4] = torch.sin(angles)
+    root[0, :, 0] = torch.tensor([0.0, 0.1, 0.2])
+    root[0, :, 2] = torch.tensor([0.0, -0.2, -0.4])
+    root[..., 1] = 1.0
+    out = conditioner(root, torch.tensor([3, 1]))
+    expected_omega = torch.deg2rad(torch.tensor(2.0)) * 30.0
+    assert torch.allclose(out[0, :2, 0], expected_omega.expand(2), atol=1e-5)
+    assert torch.allclose(out[0, 2, :3], out[0, 1, :3])
+    assert torch.equal(out[1, 0, :3], torch.zeros(3))
+    assert torch.equal(out[..., 3], torch.ones(2, 3))
 
 
 def test_flow_state_uses_imputed_clean_estimate_contract():
@@ -369,6 +467,7 @@ def test_checkpoint_persists_authoritative_next_cursor(tmp_path):
         gradient_accumulation_steps=1,
     )
     path = tmp_path / "latest.pt"
+    normalizer = HY273Normalizer(torch.zeros(273), torch.ones(273))
     save_checkpoint(
         path,
         model,
@@ -377,11 +476,59 @@ def test_checkpoint_persists_authoritative_next_cursor(tmp_path):
         epoch=7,
         step=35,
         train_state=state,
+        normalizer_state=normalizer.state_dict(),
     )
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     assert checkpoint["epoch"] == 8
     assert checkpoint["step"] == 35
     assert checkpoint["train_state"] == state
+    validate_normalizer_contract(normalizer, checkpoint["normalizer"], str(path))
+    changed = HY273Normalizer(torch.ones(273), torch.ones(273))
+    with pytest.raises(RuntimeError, match="normalizer tensor mismatch"):
+        validate_normalizer_contract(changed, checkpoint["normalizer"], str(path))
+
+
+def test_real_phase_transition_checkpoint_contract(tmp_path):
+    parser = build_arg_parser()
+    stage1 = parser.parse_args(["--config", "configs/redenoise_kimodo_like_stage1.yaml"])
+    stage1 = merge_config(stage1, load_yaml(stage1.config), explicit_cli={"config"})
+    stage2 = parser.parse_args(["--config", "configs/redenoise_kimodo_like_stage2_control.yaml"])
+    stage2 = merge_config(stage2, load_yaml(stage2.config), explicit_cli={"config"})
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=stage1.lr)
+    normalizer = HY273Normalizer(torch.zeros(273), torch.ones(273))
+    cursor = make_train_state(
+        next_epoch=1,
+        next_step_in_epoch=0,
+        optimizer_steps_per_epoch=1,
+        world_size=8,
+        batch_size_per_rank=16,
+        gradient_accumulation_steps=1,
+    )
+    path = tmp_path / "stage1.pt"
+    save_checkpoint(
+        path,
+        model,
+        optimizer,
+        stage1,
+        epoch=0,
+        step=200_000,
+        train_state=cursor,
+        normalizer_state=normalizer.state_dict(),
+    )
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    validate_resume_contract(
+        stage2,
+        checkpoint["args"],
+        str(path),
+        allowed_mismatches=(
+            "training_phase",
+            "control_modes",
+            "control_cont_loss_weight",
+            "control_contact_loss_weight",
+        ),
+    )
+    validate_normalizer_contract(normalizer, checkpoint["normalizer"], str(path))
 
 
 def test_sha256_file_hashes_checkpoint_parent_bytes(tmp_path):

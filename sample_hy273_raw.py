@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -11,6 +12,7 @@ import numpy as np
 import torch
 
 from data.kimodo273_datasets import Kimodo273TextDataset, collate_kimodo273_text
+from models.raw_motion.asset_integrity import verify_asset_manifest
 from models.raw_motion.flow_schedule import make_ode_grid
 from models.raw_motion.hy273_constraints import build_synthetic_control_batch
 from models.raw_motion.hy273_normalizer import HY273Normalizer, apply_kimodo_training_transform
@@ -20,7 +22,94 @@ from train_hy273_raw_flow import (
     predict_clean_cont,
     prediction_velocity_cont,
     resolve_representation_loss_space,
+    validate_normalizer_contract,
 )
+
+
+def verify_checkpoint_assets(train_args: argparse.Namespace) -> None:
+    manifest_path = str(getattr(train_args, "asset_manifest_path", ""))
+    if manifest_path:
+        verify_asset_manifest(
+            manifest_path,
+            expected_manifest_sha256=str(
+                getattr(train_args, "asset_manifest_sha256", "")
+            ),
+        )
+    elif str(getattr(train_args, "architecture", "one_stage")) == "redenoise_kimodo_like":
+        raise RuntimeError("redenoise_kimodo_like checkpoint has no pinned asset manifest")
+
+
+def apply_checkpoint_path_override(
+    train_args: argparse.Namespace,
+    field: str,
+    override: str,
+) -> None:
+    if not override:
+        return
+    current = str(getattr(train_args, field, ""))
+    if (
+        str(getattr(train_args, "architecture", "one_stage")) == "redenoise_kimodo_like"
+        and Path(current).expanduser().resolve() != Path(override).expanduser().resolve()
+    ):
+        raise RuntimeError(
+            f"Cannot override pinned {field} for redenoise_kimodo_like: "
+            f"checkpoint={current!r}, requested={override!r}"
+        )
+    setattr(train_args, field, override)
+
+
+def checkpoint_weight_state(
+    checkpoint: dict[str, Any],
+    weight_source: str,
+    checkpoint_path: str,
+) -> tuple[dict[str, torch.Tensor], str]:
+    resolved = weight_source
+    if resolved == "auto":
+        resolved = "ema" if "ema" in checkpoint else "model"
+    if resolved == "ema" and "ema" not in checkpoint:
+        raise ValueError(f"EMA requested but checkpoint has no EMA: {checkpoint_path}")
+    return checkpoint[resolved], resolved
+
+
+def checkpoint_normalizer(
+    checkpoint: dict[str, Any],
+    train_args: argparse.Namespace,
+    device: torch.device,
+    checkpoint_path: str,
+) -> HY273Normalizer:
+    normalizer = HY273Normalizer.from_data_root(
+        train_args.data_root,
+        stats_dir=getattr(train_args, "motion_stats_dir", "") or None,
+        variance_eps=float(getattr(train_args, "stats_variance_eps", 0.0)),
+    ).to(device)
+    if "normalizer" in checkpoint:
+        validate_normalizer_contract(normalizer, checkpoint["normalizer"], checkpoint_path)
+    elif str(getattr(train_args, "architecture", "one_stage")) == "redenoise_kimodo_like":
+        raise RuntimeError(f"redenoise_kimodo_like checkpoint lacks normalizer state: {checkpoint_path}")
+    return normalizer
+
+
+def resolve_sampling_cfg_scales(
+    train_args: argparse.Namespace,
+    text_scale: float | None,
+    control_scale: float | None,
+) -> tuple[float, float]:
+    kimodo_like = (
+        str(getattr(train_args, "architecture", "one_stage"))
+        == "redenoise_kimodo_like"
+    )
+    return (
+        float(text_scale if text_scale is not None else (3.5 if kimodo_like else 1.0)),
+        float(control_scale if control_scale is not None else (2.0 if kimodo_like else 1.0)),
+    )
+
+
+@dataclass
+class ODESampleOutput:
+    raw_motion: torch.Tensor
+    exact_clamped_motion: torch.Tensor
+    final_clean_prediction: torch.Tensor
+    final_branch_predictions: dict[str, torch.Tensor]
 
 
 @torch.no_grad()
@@ -35,12 +124,14 @@ def sample_ode(
     num_steps: int = 32,
     self_conditioning: bool = False,
     cfg_scale: float = 1.0,
+    control_cfg_scale: float = 1.0,
     contact_init: str = "random",
     contact_feedback: str = "blend",
     cfg_apply_contacts: bool = False,
     prediction_type: str = "velocity",
     velocity_t_eps: float = 1e-4,
-) -> torch.Tensor:
+    return_details: bool = False,
+) -> torch.Tensor | ODESampleOutput:
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     observed = normalizer.normalize(observed_un.to(device=device, dtype=torch.float32)).to(dtype=dtype)
@@ -61,39 +152,123 @@ def sample_ode(
         raise ValueError(f"Unknown contact_feedback: {contact_feedback}")
     contact_aux = contact_noise.clone()
     x_self_cond: Optional[torch.Tensor] = None
+    branch_self_cond: dict[str, torch.Tensor] = {}
+    final_clean = torch.cat([z_cont, contact_aux], dim=-1)
+    final_branches: dict[str, torch.Tensor] = {}
     grid = make_ode_grid(num_steps, device=device).to(dtype=dtype)
     for i in range(num_steps):
         t = grid[i].expand(bsz)
         dt = grid[i + 1] - grid[i]
         state = torch.cat([z_cont, contact_aux], dim=-1)
-        state = state * (1.0 - motion_mask) + observed * motion_mask
-        model_in = torch.cat([state, motion_mask], dim=-1)
-        pred = model(
-            model_in,
-            t=t,
-            c_dir=c_dir.to(device=device, dtype=dtype),
-            text=texts,
-            length_mask=valid,
-            x_self_cond=x_self_cond,
-            text_drop_prob=0.0,
-        )
-        if abs(float(cfg_scale) - 1.0) > 1e-6:
-            pred_uncond = model(
-                model_in,
+        zero_mask = torch.zeros_like(motion_mask)
+        controlled_state = state * (1.0 - motion_mask) + observed * motion_mask
+        input_free = torch.cat([state, zero_mask], dim=-1)
+        input_control = torch.cat([controlled_state, motion_mask], dim=-1)
+        has_control = bool(motion_mask.bool().any().item())
+
+        if has_control:
+            # Joint/text/control/empty branches share the same unclamped ODE state.
+            # Overwrite exists only in the joint and control denoiser inputs.
+            branch_input = torch.cat([input_control, input_free, input_control, input_free], dim=0)
+            branch_text = list(texts) + list(texts) + [""] * bsz + [""] * bsz
+            branch_t = t.repeat(4)
+            branch_c_dir = c_dir.to(device=device, dtype=dtype).repeat(4, 1)
+            branch_valid = valid.repeat(4, 1)
+            branch_sc = None
+            if self_conditioning and branch_self_cond:
+                branch_sc = torch.cat(
+                    [
+                        branch_self_cond["joint"],
+                        branch_self_cond["text"],
+                        branch_self_cond["control"],
+                        branch_self_cond["empty"],
+                    ],
+                    dim=0,
+                )
+            pred_all = model(
+                branch_input,
+                t=branch_t,
+                c_dir=branch_c_dir,
+                text=branch_text,
+                length_mask=branch_valid,
+                x_self_cond=branch_sc,
+                text_drop_prob=0.0,
+            )
+            pred_joint, pred_text, pred_control, pred_empty = pred_all.chunk(4, dim=0)
+            pred_guided = (
+                pred_empty
+                + float(cfg_scale) * (pred_text - pred_empty)
+                + float(control_cfg_scale) * (pred_control - pred_empty)
+            )
+            pred = pred_guided if cfg_apply_contacts else pred_joint.clone()
+            if not cfg_apply_contacts:
+                pred[..., :CONT_DIM] = pred_guided[..., :CONT_DIM]
+            final_branches = {
+                "joint": pred_joint,
+                "text": pred_text,
+                "control": pred_control,
+                "empty": pred_empty,
+            }
+            if self_conditioning:
+                next_branch_sc: dict[str, torch.Tensor] = {}
+                for name, value in final_branches.items():
+                    branch_x0_cont = predict_clean_cont(
+                        state[..., :CONT_DIM], t, value[..., :CONT_DIM], prediction_type
+                    )
+                    branch_x0 = torch.cat(
+                        [branch_x0_cont, torch.sigmoid(value[..., CONTACT_SLICE])], dim=-1
+                    )
+                    if name in {"joint", "control"}:
+                        branch_x0 = branch_x0 * (1.0 - motion_mask) + observed * motion_mask
+                    next_branch_sc[name] = branch_x0.detach()
+                branch_self_cond = next_branch_sc
+        elif abs(float(cfg_scale) - 1.0) > 1e-6:
+            branch_input = torch.cat([input_free, input_free], dim=0)
+            branch_sc = None
+            if self_conditioning and branch_self_cond:
+                branch_sc = torch.cat(
+                    [branch_self_cond["text"], branch_self_cond["empty"]], dim=0
+                )
+            pred_all = model(
+                branch_input,
+                t=t.repeat(2),
+                c_dir=c_dir.to(device=device, dtype=dtype).repeat(2, 1),
+                text=list(texts) + [""] * bsz,
+                length_mask=valid.repeat(2, 1),
+                x_self_cond=branch_sc,
+                text_drop_prob=0.0,
+            )
+            pred_text, pred_empty = pred_all.chunk(2, dim=0)
+            pred_guided = pred_empty + float(cfg_scale) * (pred_text - pred_empty)
+            pred = pred_guided if cfg_apply_contacts else pred_text.clone()
+            if not cfg_apply_contacts:
+                pred[..., :CONT_DIM] = pred_guided[..., :CONT_DIM]
+            final_branches = {"text": pred_text, "empty": pred_empty}
+            if self_conditioning:
+                branch_self_cond = {
+                    name: torch.cat(
+                        [
+                            predict_clean_cont(
+                                state[..., :CONT_DIM], t, value[..., :CONT_DIM], prediction_type
+                            ),
+                            torch.sigmoid(value[..., CONTACT_SLICE]),
+                        ],
+                        dim=-1,
+                    ).detach()
+                    for name, value in final_branches.items()
+                }
+                x_self_cond = branch_self_cond["text"]
+        else:
+            pred = model(
+                input_free,
                 t=t,
                 c_dir=c_dir.to(device=device, dtype=dtype),
                 text=texts,
                 length_mask=valid,
                 x_self_cond=x_self_cond,
                 text_drop_prob=0.0,
-                force_drop_text=True,
             )
-            pred_cfg = pred_uncond + float(cfg_scale) * (pred - pred_uncond)
-            if cfg_apply_contacts:
-                pred = pred_cfg
-            else:
-                pred = pred.clone()
-                pred[..., :CONT_DIM] = pred_cfg[..., :CONT_DIM]
+            final_branches = {"text": pred}
         pred_cont = pred[..., :CONT_DIM]
         contact_prob = torch.sigmoid(pred[..., CONTACT_SLICE])
         x0_hat_cont = predict_clean_cont(state[..., :CONT_DIM], t, pred_cont, prediction_type)
@@ -107,25 +282,43 @@ def sample_ode(
         )
         x0_hat = torch.cat([x0_hat_cont, contact_prob], dim=-1)
         x0_hat_clamped = x0_hat * (1.0 - motion_mask) + observed * motion_mask
-        z_cont_next = state[..., :CONT_DIM] + dt * v_cont
-        next_state = torch.cat([z_cont_next, contact_prob], dim=-1)
-        next_state = next_state * (1.0 - motion_mask) + observed * motion_mask
-        z_cont = next_state[..., :CONT_DIM]
+        final_clean = x0_hat
+        z_cont = state[..., :CONT_DIM] + dt * v_cont
         if contact_feedback == "blend":
             t_next = grid[i + 1].view(1, 1, 1).to(device=device, dtype=dtype)
             contact_aux = t_next * contact_prob + (1.0 - t_next) * contact_noise
         elif contact_feedback == "prob":
-            contact_aux = next_state[..., CONTACT_SLICE]
+            contact_aux = contact_prob
         else:
             contact_aux = contact_noise
-        x_self_cond = x0_hat_clamped.detach() if self_conditioning else None
+        if self_conditioning and not has_control:
+            x_self_cond = x0_hat.detach()
     final = torch.cat([z_cont, contact_aux], dim=-1)
-    final = final * (1.0 - motion_mask) + observed * motion_mask
+    final_exact = final * (1.0 - motion_mask) + observed * motion_mask
     out = normalizer.denormalize(final.float())
+    out_exact = normalizer.denormalize(final_exact.float())
+    out_clean = normalizer.denormalize(final_clean.float())
+    branch_outputs = {
+        name: normalizer.denormalize(
+            torch.cat([value[..., :CONT_DIM], torch.sigmoid(value[..., CONTACT_SLICE])], dim=-1).float()
+        )
+        for name, value in final_branches.items()
+    }
     for batch_idx in range(bsz):
         length = int(lengths[batch_idx].clamp(min=1, max=frames).item())
         if length < frames:
             out[batch_idx, length:] = out[batch_idx, length - 1 : length]
+            out_exact[batch_idx, length:] = out_exact[batch_idx, length - 1 : length]
+            out_clean[batch_idx, length:] = out_clean[batch_idx, length - 1 : length]
+            for value in branch_outputs.values():
+                value[batch_idx, length:] = value[batch_idx, length - 1 : length]
+    if return_details:
+        return ODESampleOutput(
+            raw_motion=out,
+            exact_clamped_motion=out_exact,
+            final_clean_prediction=out_clean,
+            final_branch_predictions=branch_outputs,
+        )
     return out
 
 
@@ -184,13 +377,17 @@ def main() -> None:
         help="Comma-separated dataset indices to sample. Defaults to the first --num_samples items.",
     )
     parser.add_argument("--num_steps", type=int, default=32)
-    parser.add_argument("--cfg_scale", type=float, default=1.0)
+    parser.add_argument("--cfg_scale", type=float, default=None)
+    parser.add_argument("--control_cfg_scale", type=float, default=None)
     parser.add_argument("--contact_init", choices=["random", "zeros", "half"], default="random")
     parser.add_argument("--contact_feedback", choices=["blend", "prob", "fixed"], default="blend")
     parser.add_argument("--cfg_apply_contacts", action="store_true")
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--weight_source", choices=["auto", "model", "ema"], default="auto")
-    parser.add_argument("--control_modes", default="root,endpoints,fullpose,mixed")
+    parser.add_argument(
+        "--control_modes",
+        default="root_sparse,root_dense,endpoints,fullpose,mixed",
+    )
     parser.add_argument("--endpoint_preset", choices=["kimodo_ee", "five_point"], default="")
     parser.add_argument(
         "--endpoint_subset_mode",
@@ -216,14 +413,16 @@ def main() -> None:
     np.random.seed(int(args.seed) % (2**32 - 1))
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     train_args = argparse.Namespace(**ckpt.get("args", {}))
-    if args.data_root:
-        train_args.data_root = args.data_root
-    if args.text_root:
-        train_args.text_root = args.text_root
+    cfg_scale, control_cfg_scale = resolve_sampling_cfg_scales(
+        train_args, args.cfg_scale, args.control_cfg_scale
+    )
+    apply_checkpoint_path_override(train_args, "data_root", args.data_root)
+    apply_checkpoint_path_override(train_args, "text_root", args.text_root)
     if args.text_encoder:
         train_args.text_encoder = args.text_encoder
-    if args.hytext_cache_dir:
-        train_args.hytext_cache_dir = args.hytext_cache_dir
+    apply_checkpoint_path_override(
+        train_args, "hytext_cache_dir", args.hytext_cache_dir
+    )
     if args.hytext_ctxt_dim > 0:
         train_args.hytext_ctxt_dim = args.hytext_ctxt_dim
     if args.hytext_vtxt_dim > 0:
@@ -231,18 +430,18 @@ def main() -> None:
     if args.hytext_max_open_shards > 0:
         train_args.hytext_max_open_shards = args.hytext_max_open_shards
     if args.hytext_allow_cache_miss:
+        if str(getattr(train_args, "architecture", "one_stage")) == "redenoise_kimodo_like":
+            raise RuntimeError("Pinned redenoise_kimodo_like assets require strict HYText cache lookup")
         train_args.hytext_allow_cache_miss = True
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    verify_checkpoint_assets(train_args)
     model = create_model(train_args).to(device)
-    weight_source = args.weight_source
-    if weight_source == "auto":
-        weight_source = "ema" if "ema" in ckpt else "model"
-    if weight_source == "ema" and "ema" not in ckpt:
-        raise ValueError(f"--weight_source ema requested but checkpoint has no EMA: {args.checkpoint}")
-    state_dict = ckpt["ema"] if weight_source == "ema" else ckpt["model"]
-    model.load_state_dict(state_dict, strict=False)
+    state_dict, weight_source = checkpoint_weight_state(
+        ckpt, args.weight_source, args.checkpoint
+    )
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
-    normalizer = HY273Normalizer.from_data_root(train_args.data_root).to(device)
+    normalizer = checkpoint_normalizer(ckpt, train_args, device, args.checkpoint)
     dataset = Kimodo273TextDataset(
         train_args.data_root,
         split=args.split,
@@ -303,7 +502,7 @@ def main() -> None:
     # The JiT epsilon caps the training loss weight only. ODE integration must
     # retain the rectified-flow vector field and uses only a numerical floor.
     sampling_velocity_t_eps = 1e-4
-    pred = sample_ode(
+    sample_output = sample_ode(
         model,
         normalizer,
         lengths,
@@ -313,16 +512,23 @@ def main() -> None:
         c_dir,
         num_steps=args.num_steps,
         self_conditioning=bool(getattr(train_args, "self_conditioning", False)),
-        cfg_scale=float(args.cfg_scale),
+        cfg_scale=cfg_scale,
+        control_cfg_scale=control_cfg_scale,
         contact_init=args.contact_init,
         contact_feedback=args.contact_feedback,
         cfg_apply_contacts=bool(args.cfg_apply_contacts),
         prediction_type=prediction_type,
         velocity_t_eps=sampling_velocity_t_eps,
+        return_details=True,
     )
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    np.save(out_dir / "samples.npy", pred.cpu().numpy())
+    assert isinstance(sample_output, ODESampleOutput)
+    np.save(out_dir / "samples.npy", sample_output.raw_motion.cpu().numpy())
+    np.save(out_dir / "samples_exact_clamped.npy", sample_output.exact_clamped_motion.cpu().numpy())
+    np.save(out_dir / "final_clean_prediction.npy", sample_output.final_clean_prediction.cpu().numpy())
+    for branch_name, branch_value in sample_output.final_branch_predictions.items():
+        np.save(out_dir / f"final_branch_{branch_name}.npy", branch_value.cpu().numpy())
     np.save(out_dir / "observed.npy", controls.observed_motion.cpu().numpy())
     np.save(out_dir / "mask.npy", controls.motion_mask.cpu().numpy())
     lengths_np = lengths.detach().cpu().numpy().astype(np.int64, copy=False)
@@ -332,7 +538,11 @@ def main() -> None:
             {
                 "checkpoint": args.checkpoint,
                 "num_steps": args.num_steps,
-                "cfg_scale": float(args.cfg_scale),
+                "cfg_scale": cfg_scale,
+                "control_cfg_scale": control_cfg_scale,
+                "ode_state_persistent_clamp": False,
+                "primary_output": "samples.npy (raw, pre exact-clamp)",
+                "exact_output": "samples_exact_clamped.npy",
                 "contact_init": args.contact_init,
                 "contact_feedback": args.contact_feedback,
                 "cfg_apply_contacts": bool(args.cfg_apply_contacts),
